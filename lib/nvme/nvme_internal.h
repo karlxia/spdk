@@ -423,6 +423,8 @@ struct spdk_nvme_qpair {
 
 	uint16_t				id;
 
+	uint16_t				cqid;
+
 	uint8_t					qprio;
 
 	uint8_t					state : 3;
@@ -889,6 +891,10 @@ struct spdk_nvme_ctrlr {
 
 	struct spdk_bit_array		*free_io_qids;
 	TAILQ_HEAD(, spdk_nvme_qpair)	active_io_qpairs;
+
+	int 				*cq_ref;
+	int 				*scq_map;
+	struct spdk_nvme_cpl 			**cq_vaddr_rcd;
 
 	struct spdk_nvme_ctrlr_opts	opts;
 

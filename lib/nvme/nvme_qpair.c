@@ -770,6 +770,11 @@ nvme_qpair_init(struct spdk_nvme_qpair *qpair, uint16_t id,
 
 	qpair->id = id;
 	qpair->qprio = qprio;
+	qpair->cqid = id;
+
+	if(id > 0 && ctrlr->scq_map[id] > 0){
+		qpair->cqid = ctrlr->scq_map[id];
+	}
 
 	qpair->in_completion_context = 0;
 	qpair->delete_after_completion_context = 0;

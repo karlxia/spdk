@@ -2527,6 +2527,16 @@ nvme_ctrlr_set_num_queues_done(void *arg, const struct spdk_nvme_cpl *cpl)
 		ctrlr->opts.num_io_queues = spdk_min(min_allocated, ctrlr->opts.num_io_queues);
 	}
 
+	ctrlr->cq_ref = malloc((ctrlr->opts.num_io_queues + 1) * sizeof(int));
+	ctrlr->scq_map = malloc((ctrlr->opts.num_io_queues + 1) * sizeof(int));
+	ctrlr->cq_vaddr_rcd = malloc((ctrlr->opts.num_io_queues + 1) * sizeof(struct spdk_nvme_cpl *));
+	
+	for(i = 0; i <= ctrlr->opts.num_io_queues; i++ ){
+		ctrlr->cq_ref[i] = 0;
+		ctrlr->scq_map[i] = 0;
+		ctrlr->cq_vaddr_rcd[i] = NULL;
+	}
+
 	ctrlr->free_io_qids = spdk_bit_array_create(ctrlr->opts.num_io_queues + 1);
 	if (ctrlr->free_io_qids == NULL) {
 		nvme_ctrlr_set_state(ctrlr, NVME_CTRLR_STATE_ERROR, NVME_TIMEOUT_INFINITE);
