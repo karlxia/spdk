@@ -962,6 +962,11 @@ nvme_pcie_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 			pqpair->flags.phase = !pqpair->flags.phase;
 		}
 
+		if(cpl->sqid != qpair->id){
+			continue;
+		}
+
+		//process cpl
 		tr = &pqpair->tr[cpl->cid];
 		/* Prefetch the req's STAILQ_ENTRY since we'll need to access it
 		 * as part of putting the req back on the qpair's free list.
@@ -982,6 +987,8 @@ nvme_pcie_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		}
 	}
 
+	ctrlr->sq_cqhd[qpair->id] = pqpair->cq_head;
+	
 	if (num_completions > 0) {
 		pqpair->stat->completions += num_completions;
 		nvme_pcie_qpair_ring_cq_doorbell(qpair);

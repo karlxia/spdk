@@ -305,7 +305,22 @@ nvme_pcie_qpair_ring_cq_doorbell(struct spdk_nvme_qpair *qpair)
 {
 	struct nvme_pcie_qpair	*pqpair = nvme_pcie_qpair(qpair);
 	struct nvme_pcie_ctrlr	*pctrlr = nvme_pcie_ctrlr(qpair->ctrlr);
+	struct spdk_nvme_ctrlr	*ctrlr = qpair->ctrlr;
 	bool need_mmio = true;
+	bool need_update_cqhd = true;
+	int i;
+
+	//not update reg untill all sq finished retreive
+	//return if not all sq cq_head update to current cq_head
+	for(i = 1; i < ctrlr->opts.num_io_queues + 1; i++){
+		if(ctrlr->scq_map[i] == qpair->cqid && ctrlr->sq_cqhd != pqpair->cq_head){
+			need_update_cqhd = false;
+		}
+	}
+
+	if(!need_update_cqhd){
+		return;
+	}
 
 	if (spdk_unlikely(pqpair->flags.has_shadow_doorbell)) {
 		need_mmio = nvme_pcie_qpair_update_mmio_required(qpair,

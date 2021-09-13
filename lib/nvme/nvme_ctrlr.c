@@ -2529,11 +2529,13 @@ nvme_ctrlr_set_num_queues_done(void *arg, const struct spdk_nvme_cpl *cpl)
 
 	ctrlr->cq_ref = malloc((ctrlr->opts.num_io_queues + 1) * sizeof(int));
 	ctrlr->scq_map = malloc((ctrlr->opts.num_io_queues + 1) * sizeof(int));
+	ctrlr->sq_cqhd = malloc((ctrlr->opts.num_io_queues + 1) * sizeof(uint16_t));
 	ctrlr->cq_vaddr_rcd = malloc((ctrlr->opts.num_io_queues + 1) * sizeof(struct spdk_nvme_cpl *));
 	
 	for(i = 0; i <= ctrlr->opts.num_io_queues; i++ ){
 		ctrlr->cq_ref[i] = 0;
 		ctrlr->scq_map[i] = 0;
+		ctrlr->sq_cqhd[i] = 0;
 		ctrlr->cq_vaddr_rcd[i] = NULL;
 	}
 

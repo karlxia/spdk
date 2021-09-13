@@ -894,6 +894,7 @@ struct spdk_nvme_ctrlr {
 
 	int 				*cq_ref;
 	int 				*scq_map;
+	uint16_t			*sq_cqhd;
 	struct spdk_nvme_cpl 			**cq_vaddr_rcd;
 
 	struct spdk_nvme_ctrlr_opts	opts;
