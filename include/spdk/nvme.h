@@ -3791,6 +3791,8 @@ int spdk_nvme_cuse_unregister(struct spdk_nvme_ctrlr *ctrlr);
  */
 struct spdk_memory_domain *spdk_nvme_ctrlr_get_memory_domain(const struct spdk_nvme_ctrlr *ctrlr);
 
+void spdk_nvme_ctrlr_add_scq_map(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid, uint16_t cqid);
+
 /**
  * Opaque handle for a transport poll group. Used by the transport function table.
  */

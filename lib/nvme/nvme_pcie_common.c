@@ -73,8 +73,9 @@ nvme_pcie_qpair_reset(struct spdk_nvme_qpair *qpair)
 
 	/* all head/tail vals are set to 0 */
 	pqpair->last_sq_tail = pqpair->sq_tail = pqpair->sq_head = pqpair->cq_head = 0;
-	qpair->ctrlr->sq_cqhd[qpair->id] = pqpair->cq_head;
-
+	if(qpair->id > 0){
+		qpair->ctrlr->sq_cqhd[qpair->id] = pqpair->cq_head;
+	}
 	/*
 	 * First time through the completion queue, HW will set phase
 	 *  bit on completions to 1.  So set this to 1 here, indicating
@@ -421,7 +422,7 @@ nvme_pcie_ctrlr_cmd_create_io_sq(struct spdk_nvme_ctrlr *ctrlr,
 	cmd->cdw10_bits.create_io_q.qsize = pqpair->num_entries - 1;
 	cmd->cdw11_bits.create_io_sq.pc = 1;
 	cmd->cdw11_bits.create_io_sq.qprio = io_que->qprio;
-	cmd->cdw11_bits.create_io_sq.cqid = io_que->id;
+	cmd->cdw11_bits.create_io_sq.cqid = io_que->cqid;
 	cmd->dptr.prp.prp1 = pqpair->cmd_bus_addr;
 
 	return nvme_ctrlr_submit_admin_request(ctrlr, req);
@@ -445,7 +446,7 @@ nvme_pcie_ctrlr_cmd_delete_io_cq(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme
 
 	cmd = &req->cmd;
 	cmd->opc = SPDK_NVME_OPC_DELETE_IO_CQ;
-	cmd->cdw10_bits.delete_io_q.qid = qpair->id;
+	cmd->cdw10_bits.delete_io_q.qid = qpair->cqid;
 
 	return nvme_ctrlr_submit_admin_request(ctrlr, req);
 }
@@ -615,6 +616,7 @@ _nvme_pcie_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme
 		}
 
 	} else {
+		printf("sqid is %d, cqid is %d.\n", qpair->id, qpair->cqid);
 		rc = nvme_pcie_ctrlr_cmd_create_io_cq(ctrlr, qpair, nvme_completion_create_cq_cb, qpair);
 
 		if (rc != 0) {
@@ -987,7 +989,9 @@ nvme_pcie_qpair_process_completions(struct spdk_nvme_qpair *qpair, uint32_t max_
 		}
 	}
 
-	ctrlr->sq_cqhd[qpair->id] = pqpair->cq_head;
+	if(qpair->id > 0){
+		ctrlr->sq_cqhd[qpair->id] = pqpair->cq_head;
+	}
 
 	if (num_completions > 0) {
 		pqpair->stat->completions += num_completions;
@@ -1170,6 +1174,10 @@ nvme_pcie_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_
 	ctrlr->cq_ref[qpair->cqid]--;	// fixme, assume command complete successfully
 	// ctrlr->scq_map[qpair->id] = 0;	//map info should not be changed auto
 	ctrlr->sq_cqhd[qpair->id] = 0;
+
+	if(ctrlr->cq_ref[qpair->cqid] > 0){
+		return 0;
+	}
 
 	/* Delete the completion queue */
 	rc = nvme_pcie_ctrlr_cmd_delete_io_cq(ctrlr, qpair, nvme_completion_poll_cb, status);

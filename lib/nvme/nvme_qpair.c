@@ -773,6 +773,7 @@ nvme_qpair_init(struct spdk_nvme_qpair *qpair, uint16_t id,
 	qpair->cqid = id;
 
 	if(id > 0 && ctrlr->scq_map[id] > 0){
+		printf("set cqid of queue %d to %d.\n", id, ctrlr->scq_map[id]);
 		qpair->cqid = ctrlr->scq_map[id];
 	}
 

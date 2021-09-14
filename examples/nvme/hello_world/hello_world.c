@@ -84,6 +84,8 @@ struct hello_world_sequence {
 	char		*buf;
 	unsigned        using_cmb_io;
 	int		is_completed;
+	uint64_t	slba;
+	uint32_t	nblk;
 };
 
 static void
@@ -146,8 +148,8 @@ write_complete(void *arg, const struct spdk_nvme_cpl *completion)
 	sequence->buf = spdk_zmalloc(0x1000, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 
 	rc = spdk_nvme_ns_cmd_read(ns_entry->ns, ns_entry->qpair, sequence->buf,
-				   0, /* LBA start */
-				   1, /* number of LBAs */
+					sequence->slba, /* LBA start */
+					sequence->nblk, /* number of LBAs */
 				   read_complete, (void *)sequence, 0);
 	if (rc != 0) {
 		fprintf(stderr, "starting read I/O failed\n");
@@ -197,6 +199,7 @@ hello_world(void)
 {
 	struct ns_entry			*ns_entry;
 	struct hello_world_sequence	sequence;
+	struct spdk_nvme_qpair	*qpair_tmp;
 	int				rc;
 	size_t				sz;
 
@@ -213,6 +216,7 @@ hello_world(void)
 		 *  qpair.  This enables extremely efficient I/O processing by making all
 		 *  I/O operations completely lockless.
 		 */
+		qpair_tmp = spdk_nvme_ctrlr_alloc_io_qpair(ns_entry->ctrlr, NULL, 0);
 		ns_entry->qpair = spdk_nvme_ctrlr_alloc_io_qpair(ns_entry->ctrlr, NULL, 0);
 		if (ns_entry->qpair == NULL) {
 			printf("ERROR: spdk_nvme_ctrlr_alloc_io_qpair() failed\n");
@@ -256,7 +260,7 @@ hello_world(void)
 		 *  0 on the namespace, and then later read it back into a separate buffer
 		 *  to demonstrate the full I/O path.
 		 */
-		snprintf(sequence.buf, 0x1000, "%s", "Hello world!\n");
+		snprintf(sequence.buf, 0x1000, "%s", "Hello world hhh!\n");
 
 		/*
 		 * Write the data buffer to LBA 0 of this namespace.  "write_complete" and
@@ -272,9 +276,11 @@ hello_world(void)
 		 *  It is the responsibility of the application to trigger the polling
 		 *  process.
 		 */
+		sequence.slba = 0;
+		sequence.nblk = 1;
 		rc = spdk_nvme_ns_cmd_write(ns_entry->ns, ns_entry->qpair, sequence.buf,
-					    0, /* LBA start */
-					    1, /* number of LBAs */
+					    sequence.slba, /* LBA start */
+					    sequence.nblk, /* number of LBAs */
 					    write_complete, &sequence, 0);
 		if (rc != 0) {
 			fprintf(stderr, "starting write I/O failed\n");
@@ -305,6 +311,7 @@ hello_world(void)
 		 *  pending I/O are completed before trying to free the qpair.
 		 */
 		spdk_nvme_ctrlr_free_io_qpair(ns_entry->qpair);
+		spdk_nvme_ctrlr_free_io_qpair(qpair_tmp);
 	}
 }
 
@@ -366,6 +373,10 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 		}
 		register_ns(ctrlr, ns);
 	}
+
+	printf("set scq map.\n");
+	spdk_nvme_ctrlr_add_scq_map(ctrlr, 1, 1);
+	spdk_nvme_ctrlr_add_scq_map(ctrlr, 2, 1);
 }
 
 static void

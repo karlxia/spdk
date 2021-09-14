@@ -376,6 +376,7 @@ nvme_transport_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nv
 	qpair->transport_failure_reason = SPDK_NVME_QPAIR_FAILURE_NONE;
 
 	nvme_qpair_set_state(qpair, NVME_QPAIR_CONNECTING);
+	printf("nvme_transport_ctrlr_connect_qpair sq_id is %d, cq_id is %d.\n", qpair->id, qpair->cqid);
 	rc = transport->ops.ctrlr_connect_qpair(ctrlr, qpair);
 	if (rc != 0) {
 		goto err;

@@ -308,13 +308,15 @@ nvme_pcie_qpair_ring_cq_doorbell(struct spdk_nvme_qpair *qpair)
 	struct spdk_nvme_ctrlr	*ctrlr = qpair->ctrlr;
 	bool need_mmio = true;
 	bool need_update_cqhd = true;
-	int i;
+	uint32_t i;
 
 	//not update reg untill all sq finished retreive
 	//return if not all sq cq_head update to current cq_head
-	for(i = 1; i < ctrlr->opts.num_io_queues + 1; i++){
-		if(ctrlr->scq_map[i] == qpair->cqid && ctrlr->sq_cqhd != pqpair->cq_head){
-			need_update_cqhd = false;
+	if(qpair->id > 0){
+		for(i = 1; i < ctrlr->opts.num_io_queues + 1; i++){
+			if(ctrlr->scq_map[i] == qpair->cqid && ctrlr->sq_cqhd[i] != pqpair->cq_head){
+				need_update_cqhd = false;
+			}
 		}
 	}
 

@@ -4884,3 +4884,9 @@ spdk_nvme_ctrlr_get_memory_domain(const struct spdk_nvme_ctrlr *ctrlr)
 {
 	return nvme_transport_ctrlr_get_memory_domain(ctrlr);
 }
+
+void
+spdk_nvme_ctrlr_add_scq_map(struct spdk_nvme_ctrlr *ctrlr, uint16_t qid, uint16_t cqid)
+{
+	ctrlr->scq_map[qid] = cqid;
+}
