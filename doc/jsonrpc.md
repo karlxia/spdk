@@ -6022,6 +6022,8 @@ sock_priority               | Optional | number  | The socket priority of the co
 acceptor_backlog            | Optional | number  | The number of pending connections allowed in backlog before failing new connection attempts (RDMA only)
 abort_timeout_sec           | Optional | number  | Abort execution timeout value, in seconds
 no_wr_batching              | Optional | boolean | Disable work requests batching (RDMA only)
+control_msg_num             | Optional | number  | The number of control messages per poll group (TCP only)
+disable_mappable_bar0       | Optional | boolean | disable client mmap() of BAR0 (VFIO-USER only)
 
 #### Example
 
@@ -6765,9 +6767,13 @@ Example response:
 
 #### Parameters
 
+The user may specify no parameters in order to list all transports, or a transport may be
+specified by type.
+
 Name                        | Optional | Type        | Description
 --------------------------- | -------- | ------------| -----------
 tgt_name                    | Optional | string      | Parent NVMe-oF target name.
+trtype                      | Optional | string      | Transport type.
 
 #### Example
 

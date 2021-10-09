@@ -230,7 +230,7 @@ if [ $SPDK_RUN_FUNCTIONAL_TEST -eq 1 ]; then
 		# enabled, it catches SEGV earlier than our handler which
 		# breaks the hotplug logic.
 		if [ $SPDK_RUN_ASAN -eq 0 ]; then
-			run_test "nvme_hotplug" test/nvme/hotplug.sh root
+			run_test "nvme_hotplug" test/nvme/hotplug.sh
 		fi
 	fi
 
@@ -356,6 +356,8 @@ trap - SIGINT SIGTERM EXIT
 
 # catch any stray core files
 process_core
+
+[[ -f "$output_dir/udev.log" ]] && rm -f "$output_dir/udev.log"
 
 if hash lcov && ! [[ "$CC_TYPE" == *"clang"* ]]; then
 	# generate coverage data and combine with baseline

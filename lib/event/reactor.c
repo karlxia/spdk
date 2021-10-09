@@ -527,10 +527,11 @@ spdk_event_call(struct spdk_event *event)
 	}
 }
 
-static inline uint32_t
-event_queue_run_batch(struct spdk_reactor *reactor)
+static inline int
+event_queue_run_batch(void *arg)
 {
-	unsigned count, i;
+	struct spdk_reactor *reactor = arg;
+	size_t count, i;
 	void *events[SPDK_EVENT_BATCH_SIZE];
 	struct spdk_thread *thread;
 	struct spdk_lw_thread *lw_thread;
@@ -598,7 +599,7 @@ event_queue_run_batch(struct spdk_reactor *reactor)
 
 	spdk_mempool_put_bulk(g_spdk_event_mempool, events, count);
 
-	return count;
+	return (int)count;
 }
 
 /* 1s */
@@ -1149,7 +1150,8 @@ _schedule_thread(void *arg1, void *arg2)
 		int rc;
 
 		efd = spdk_thread_get_interrupt_fd(thread);
-		rc = spdk_fd_group_add(reactor->fgrp, efd, thread_process_interrupts, thread);
+		rc = SPDK_FD_GROUP_ADD(reactor->fgrp, efd,
+				       thread_process_interrupts, thread);
 		if (rc < 0) {
 			SPDK_ERRLOG("Failed to schedule spdk_thread: %s.\n", spdk_strerror(-rc));
 		}
@@ -1412,7 +1414,7 @@ reactor_interrupt_init(struct spdk_reactor *reactor)
 		goto err;
 	}
 
-	rc = spdk_fd_group_add(reactor->fgrp, reactor->resched_fd, reactor_schedule_thread_event,
+	rc = SPDK_FD_GROUP_ADD(reactor->fgrp, reactor->resched_fd, reactor_schedule_thread_event,
 			       reactor);
 	if (rc) {
 		close(reactor->resched_fd);
@@ -1428,8 +1430,8 @@ reactor_interrupt_init(struct spdk_reactor *reactor)
 		goto err;
 	}
 
-	rc = spdk_fd_group_add(reactor->fgrp, reactor->events_fd,
-			       (spdk_fd_fn)event_queue_run_batch, reactor);
+	rc = SPDK_FD_GROUP_ADD(reactor->fgrp, reactor->events_fd,
+			       event_queue_run_batch, reactor);
 	if (rc) {
 		spdk_fd_group_remove(reactor->fgrp, reactor->resched_fd);
 		close(reactor->resched_fd);

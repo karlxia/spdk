@@ -271,7 +271,7 @@ rpc_bdev_nvme_attach_controller(struct spdk_jsonrpc_request *request,
 {
 	struct rpc_bdev_nvme_attach_controller_ctx *ctx;
 	struct spdk_nvme_transport_id trid = {};
-	struct spdk_nvme_host_id hostid = {};
+	const struct spdk_nvme_ctrlr_opts *opts;
 	uint32_t prchk_flags = 0;
 	struct nvme_ctrlr *ctrlr = NULL;
 	size_t len, maxlen;
@@ -363,32 +363,57 @@ rpc_bdev_nvme_attach_controller(struct spdk_jsonrpc_request *request,
 	}
 
 	if (ctx->req.hostaddr) {
-		maxlen = sizeof(hostid.hostaddr);
+		maxlen = sizeof(ctx->req.opts.src_addr);
 		len = strnlen(ctx->req.hostaddr, maxlen);
 		if (len == maxlen) {
 			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL, "hostaddr too long: %s",
 							     ctx->req.hostaddr);
 			goto cleanup;
 		}
-		memcpy(hostid.hostaddr, ctx->req.hostaddr, len + 1);
+		snprintf(ctx->req.opts.src_addr, maxlen, "%s", ctx->req.hostaddr);
 	}
 
 	if (ctx->req.hostsvcid) {
-		maxlen = sizeof(hostid.hostsvcid);
+		maxlen = sizeof(ctx->req.opts.src_svcid);
 		len = strnlen(ctx->req.hostsvcid, maxlen);
 		if (len == maxlen) {
 			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL, "hostsvcid too long: %s",
 							     ctx->req.hostsvcid);
 			goto cleanup;
 		}
-		memcpy(hostid.hostsvcid, ctx->req.hostsvcid, len + 1);
+		snprintf(ctx->req.opts.src_svcid, maxlen, "%s", ctx->req.hostsvcid);
 	}
 
 	ctrlr = nvme_ctrlr_get_by_name(ctx->req.name);
 
-	if (ctrlr && (ctx->req.hostaddr || ctx->req.hostnqn || ctx->req.hostsvcid || ctx->req.prchk_guard ||
-		      ctx->req.prchk_reftag)) {
-		goto conflicting_arguments;
+	if (ctrlr) {
+		/* This controller already exists. Verify the parameters match sufficiently. */
+		opts = spdk_nvme_ctrlr_get_opts(ctrlr->ctrlr);
+
+		if (strncmp(trid.subnqn,
+			    spdk_nvme_ctrlr_get_transport_id(ctrlr->ctrlr)->subnqn,
+			    SPDK_NVMF_NQN_MAX_LEN) != 0) {
+			/* Different SUBNQN is not allowed when specifying the same controller name. */
+			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
+							     "A controller named %s already exists, but uses a different subnqn (%s)\n",
+							     ctx->req.name, spdk_nvme_ctrlr_get_transport_id(ctrlr->ctrlr)->subnqn);
+			goto cleanup;
+		}
+
+		if (strncmp(ctx->req.opts.hostnqn, opts->hostnqn, SPDK_NVMF_NQN_MAX_LEN) != 0) {
+			/* Different HOSTNQN is not allowed when specifying the same controller name. */
+			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
+							     "A controller named %s already exists, but uses a different hostnqn (%s)\n",
+							     ctx->req.name, opts->hostnqn);
+			goto cleanup;
+		}
+
+		if (ctx->req.prchk_guard || ctx->req.prchk_reftag) {
+			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
+							     "A controller named %s already exists. To add a path, do not specify PI options.\n",
+							     ctx->req.name);
+			goto cleanup;
+		}
 	}
 
 	if (ctx->req.prchk_reftag) {
@@ -401,8 +426,9 @@ rpc_bdev_nvme_attach_controller(struct spdk_jsonrpc_request *request,
 
 	ctx->request = request;
 	ctx->count = NVME_MAX_BDEVS_PER_RPC;
-	rc = bdev_nvme_create(&trid, &hostid, ctx->req.name, ctx->names, ctx->count,
-			      prchk_flags, rpc_bdev_nvme_attach_controller_done, ctx, &ctx->req.opts);
+	rc = bdev_nvme_create(&trid, ctx->req.name, ctx->names, ctx->count, prchk_flags,
+			      rpc_bdev_nvme_attach_controller_done, ctx, &ctx->req.opts,
+			      false);
 	if (rc) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
 		goto cleanup;
@@ -410,9 +436,6 @@ rpc_bdev_nvme_attach_controller(struct spdk_jsonrpc_request *request,
 
 	return;
 
-conflicting_arguments:
-	spdk_jsonrpc_send_error_response_fmt(request, -EINVAL,
-					     "Invalid agrgument list. Existing controller name cannot be combined with host information or PI options.\n");
 cleanup:
 	free_rpc_bdev_nvme_attach_controller(&ctx->req);
 	free(ctx);
@@ -428,10 +451,10 @@ rpc_dump_nvme_controller_info(struct nvme_ctrlr *nvme_ctrlr, void *ctx)
 	struct spdk_nvme_transport_id	*trid;
 	const struct spdk_nvme_ctrlr_opts *opts;
 
-	trid = nvme_ctrlr->connected_trid;
+	trid = &nvme_ctrlr->connected_trid->trid;
 
 	spdk_json_write_object_begin(w);
-	spdk_json_write_named_string(w, "name", nvme_ctrlr->name);
+	spdk_json_write_named_string(w, "name", nvme_ctrlr->nbdev_ctrlr->name);
 
 #ifdef SPDK_CONFIG_NVME_CUSE
 	size_t cuse_name_size = 128;
@@ -553,7 +576,6 @@ rpc_bdev_nvme_detach_controller(struct spdk_jsonrpc_request *request,
 	struct spdk_nvme_transport_id trid = {};
 	size_t len, maxlen;
 	int rc = 0;
-	bool all_trid_entries, one_trid_entry;
 
 	if (spdk_json_decode_object(params, rpc_bdev_nvme_detach_controller_decoders,
 				    SPDK_COUNTOF(rpc_bdev_nvme_detach_controller_decoders),
@@ -563,18 +585,8 @@ rpc_bdev_nvme_detach_controller(struct spdk_jsonrpc_request *request,
 		goto cleanup;
 	}
 
-	all_trid_entries = req.trtype && req.traddr && req.adrfam && req.trsvcid && req.subnqn;
-	one_trid_entry = req.trtype || req.traddr || req.adrfam || req.trsvcid || req.subnqn;
-
-	if (all_trid_entries ^ one_trid_entry) {
-		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
-						 "trtype, traddr, adrfam, trsvcid, subnqn must all be provided together or not at all.");
-		goto cleanup;
-	}
-
-	if (all_trid_entries) {
-		/* Parse trtype */
-		rc = spdk_nvme_transport_id_parse_trtype(&trid.trtype, req.trtype);
+	if (req.trtype != NULL) {
+		rc = spdk_nvme_transport_id_populate_trstring(&trid, req.trtype);
 		if (rc < 0) {
 			SPDK_ERRLOG("Failed to parse trtype: %s\n", req.trtype);
 			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL, "Failed to parse trtype: %s",
@@ -582,7 +594,16 @@ rpc_bdev_nvme_detach_controller(struct spdk_jsonrpc_request *request,
 			goto cleanup;
 		}
 
-		/* Parse traddr */
+		rc = spdk_nvme_transport_id_parse_trtype(&trid.trtype, req.trtype);
+		if (rc < 0) {
+			SPDK_ERRLOG("Failed to parse trtype: %s\n", req.trtype);
+			spdk_jsonrpc_send_error_response_fmt(request, -EINVAL, "Failed to parse trtype: %s",
+							     req.trtype);
+			goto cleanup;
+		}
+	}
+
+	if (req.traddr != NULL) {
 		maxlen = sizeof(trid.traddr);
 		len = strnlen(req.traddr, maxlen);
 		if (len == maxlen) {
@@ -591,7 +612,9 @@ rpc_bdev_nvme_detach_controller(struct spdk_jsonrpc_request *request,
 			goto cleanup;
 		}
 		memcpy(trid.traddr, req.traddr, len + 1);
+	}
 
+	if (req.adrfam != NULL) {
 		rc = spdk_nvme_transport_id_parse_adrfam(&trid.adrfam, req.adrfam);
 		if (rc < 0) {
 			SPDK_ERRLOG("Failed to parse adrfam: %s\n", req.adrfam);
@@ -599,7 +622,9 @@ rpc_bdev_nvme_detach_controller(struct spdk_jsonrpc_request *request,
 							     req.adrfam);
 			goto cleanup;
 		}
+	}
 
+	if (req.trsvcid != NULL) {
 		maxlen = sizeof(trid.trsvcid);
 		len = strnlen(req.trsvcid, maxlen);
 		if (len == maxlen) {
@@ -608,7 +633,10 @@ rpc_bdev_nvme_detach_controller(struct spdk_jsonrpc_request *request,
 			goto cleanup;
 		}
 		memcpy(trid.trsvcid, req.trsvcid, len + 1);
+	}
 
+	/* Parse subnqn */
+	if (req.subnqn != NULL) {
 		maxlen = sizeof(trid.subnqn);
 		len = strnlen(req.subnqn, maxlen);
 		if (len == maxlen) {
@@ -617,10 +645,9 @@ rpc_bdev_nvme_detach_controller(struct spdk_jsonrpc_request *request,
 			goto cleanup;
 		}
 		memcpy(trid.subnqn, req.subnqn, len + 1);
-		rc = bdev_nvme_delete(req.name, &trid);
-	} else {
-		rc = bdev_nvme_delete(req.name, NULL);
 	}
+
+	rc = bdev_nvme_delete(req.name, &trid);
 
 	if (rc != 0) {
 		spdk_jsonrpc_send_error_response(request, rc, spdk_strerror(-rc));
@@ -1015,6 +1042,18 @@ rpc_bdev_nvme_pcie_stats(struct spdk_json_write_ctx *w,
 }
 
 static void
+rpc_bdev_nvme_tcp_stats(struct spdk_json_write_ctx *w,
+			struct spdk_nvme_transport_poll_group_stat *stat)
+{
+	spdk_json_write_named_uint64(w, "polls", stat->tcp.polls);
+	spdk_json_write_named_uint64(w, "idle_polls", stat->tcp.idle_polls);
+	spdk_json_write_named_uint64(w, "socket_completions", stat->tcp.socket_completions);
+	spdk_json_write_named_uint64(w, "nvme_completions", stat->tcp.nvme_completions);
+	spdk_json_write_named_uint64(w, "queued_requests", stat->tcp.queued_requests);
+	spdk_json_write_named_uint64(w, "submitted_requests", stat->tcp.submitted_requests);
+}
+
+static void
 rpc_bdev_nvme_stats_per_channel(struct spdk_io_channel_iter *i)
 {
 	struct rpc_bdev_nvme_transport_stat_ctx *ctx;
@@ -1050,6 +1089,9 @@ rpc_bdev_nvme_stats_per_channel(struct spdk_io_channel_iter *i)
 			break;
 		case SPDK_NVME_TRANSPORT_PCIE:
 			rpc_bdev_nvme_pcie_stats(ctx->w, tr_stat);
+			break;
+		case SPDK_NVME_TRANSPORT_TCP:
+			rpc_bdev_nvme_tcp_stats(ctx->w, tr_stat);
 			break;
 		default:
 			SPDK_WARNLOG("Can't handle trtype %d %s\n", tr_stat->trtype,
@@ -1099,7 +1141,7 @@ rpc_bdev_nvme_get_transport_statistics(struct spdk_jsonrpc_request *request,
 	spdk_json_write_object_begin(ctx->w);
 	spdk_json_write_named_array_begin(ctx->w, "poll_groups");
 
-	spdk_for_each_channel(&g_nvme_ctrlrs,
+	spdk_for_each_channel(&g_nvme_bdev_ctrlrs,
 			      rpc_bdev_nvme_stats_per_channel,
 			      ctx,
 			      rpc_bdev_nvme_stats_done);

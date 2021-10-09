@@ -497,6 +497,15 @@ struct spdk_nvme_pcie_stat {
 	uint64_t sq_doobell_updates;
 };
 
+struct spdk_nvme_tcp_stat {
+	uint64_t polls;
+	uint64_t idle_polls;
+	uint64_t socket_completions;
+	uint64_t nvme_completions;
+	uint64_t submitted_requests;
+	uint64_t queued_requests;
+};
+
 struct spdk_nvme_transport_poll_group_stat {
 	spdk_nvme_transport_type_t trtype;
 	union {
@@ -505,6 +514,7 @@ struct spdk_nvme_transport_poll_group_stat {
 			struct spdk_nvme_rdma_device_stat *device_stats;
 		} rdma;
 		struct spdk_nvme_pcie_stat pcie;
+		struct spdk_nvme_tcp_stat tcp;
 	};
 };
 
@@ -2109,9 +2119,6 @@ int spdk_nvme_ctrlr_cmd_security_send(struct spdk_nvme_ctrlr *ctrlr, uint8_t sec
  *
  * This function is thread safe and can be called at any point after spdk_nvme_probe().
  *
- * Call spdk_nvme_ctrlr_process_admin_completions() to poll for completion of
- * commands submitted through this function.
- *
  * \param ctrlr NVMe controller to use for security receive command submission.
  * \param secp Security Protocol that is used.
  * \param spsp Security Protocol Specific field.
@@ -2130,9 +2137,6 @@ int spdk_nvme_ctrlr_security_receive(struct spdk_nvme_ctrlr *ctrlr, uint8_t secp
  * Send security protocol data to controller.
  *
  * This function is thread safe and can be called at any point after spdk_nvme_probe().
- *
- * Call spdk_nvme_ctrlr_process_admin_completions() to poll for completion of
- * commands submitted through this function.
  *
  * \param ctrlr NVMe controller to use for security send command submission.
  * \param secp Security Protocol that is used.
@@ -2218,9 +2222,6 @@ uint64_t spdk_nvme_ctrlr_get_flags(struct spdk_nvme_ctrlr *ctrlr);
  *
  * This function is thread safe and can be called at any point after spdk_nvme_probe().
  *
- * Call spdk_nvme_ctrlr_process_admin_completions() to poll for completion of
- * commands submitted through this function.
- *
  * \param ctrlr NVMe controller to use for command submission.
  * \param nsid Namespace identifier for namespace to attach.
  * \param payload The pointer to the controller list.
@@ -2235,9 +2236,6 @@ int spdk_nvme_ctrlr_attach_ns(struct spdk_nvme_ctrlr *ctrlr, uint32_t nsid,
  * Detach the specified namespace from controllers.
  *
  * This function is thread safe and can be called at any point after spdk_nvme_probe().
- *
- * Call spdk_nvme_ctrlr_process_admin_completions() to poll for completion of
- * commands submitted through this function.
  *
  * \param ctrlr NVMe controller to use for command submission.
  * \param nsid Namespace ID to detach.
@@ -2266,9 +2264,6 @@ uint32_t spdk_nvme_ctrlr_create_ns(struct spdk_nvme_ctrlr *ctrlr,
  * Delete a namespace.
  *
  * This function is thread safe and can be called at any point after spdk_nvme_probe().
- *
- * Call spdk_nvme_ctrlr_process_admin_completions() to poll for completion of
- * commands submitted through this function.
  *
  * \param ctrlr NVMe controller to delete namespace from.
  * \param nsid The namespace identifier.
@@ -3784,12 +3779,23 @@ int spdk_nvme_cuse_register(struct spdk_nvme_ctrlr *ctrlr);
 int spdk_nvme_cuse_unregister(struct spdk_nvme_ctrlr *ctrlr);
 
 /**
- * Get SPDK memory domain used by the given nvme controller.
+ * Get SPDK memory domains used by the given nvme controller.
+ *
+ * The user can call this function with \b domains set to NULL and \b array_size set to 0 to get the
+ * number of memory domains used by nvme controller
  *
  * \param ctrlr Opaque handle to the NVMe controller.
- * \return Pointer to memory domain used by this controller or NULL
+ * \param domains Pointer to an array of memory domains to be filled by this function. The user should allocate big enough
+ * array to keep all memory domains used by nvme controller
+ * \param array_size size of \b domains array
+ * \return the number of entries in \b domains array or negated errno. If returned value is bigger than \b array_size passed by the user
+ * then the user should increase the size of \b domains array and call this function again. There is no guarantees that
+ * the content of \b domains array is valid in that case.
+ *         -EINVAL if input parameters were invalid
+
  */
-struct spdk_memory_domain *spdk_nvme_ctrlr_get_memory_domain(const struct spdk_nvme_ctrlr *ctrlr);
+int spdk_nvme_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
+				       struct spdk_memory_domain **domains, int array_size);
 
 /**
  * Opaque handle for a transport poll group. Used by the transport function table.
@@ -3803,6 +3809,15 @@ struct spdk_nvme_transport_poll_group;
  *
  */
 void spdk_nvme_cuse_update_namespaces(struct spdk_nvme_ctrlr *ctrlr);
+
+/**
+ * Signature for callback invoked after completing a register read/write operation.
+ *
+ * \param ctx Context passed by the user.
+ * \param value Value of the register, undefined in case of a failure.
+ * \param cpl Completion queue entry that contains the status of the command.
+ */
+typedef void (*spdk_nvme_reg_cb)(void *ctx, uint64_t value, const struct spdk_nvme_cpl *cpl);
 
 struct nvme_request;
 
@@ -3830,6 +3845,18 @@ struct spdk_nvme_transport_ops {
 	int (*ctrlr_get_reg_4)(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t *value);
 
 	int (*ctrlr_get_reg_8)(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t *value);
+
+	int (*ctrlr_set_reg_4_async)(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t value,
+				     spdk_nvme_reg_cb cb_fn, void *cb_arg);
+
+	int (*ctrlr_set_reg_8_async)(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t value,
+				     spdk_nvme_reg_cb cb_fn, void *cb_arg);
+
+	int (*ctrlr_get_reg_4_async)(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
+				     spdk_nvme_reg_cb cb_fn, void *cb_arg);
+
+	int (*ctrlr_get_reg_8_async)(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
+				     spdk_nvme_reg_cb cb_fn, void *cb_arg);
 
 	uint32_t (*ctrlr_get_max_xfer_size)(struct spdk_nvme_ctrlr *ctrlr);
 
@@ -3896,7 +3923,9 @@ struct spdk_nvme_transport_ops {
 	void (*poll_group_free_stats)(struct spdk_nvme_transport_poll_group *tgroup,
 				      struct spdk_nvme_transport_poll_group_stat *stats);
 
-	struct spdk_memory_domain *(*ctrlr_get_memory_domain)(const struct spdk_nvme_ctrlr *ctrlr);
+	int (*ctrlr_get_memory_domains)(const struct spdk_nvme_ctrlr *ctrlr,
+					struct spdk_memory_domain **domains,
+					int array_size);
 };
 
 /**

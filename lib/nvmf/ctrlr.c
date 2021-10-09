@@ -1925,7 +1925,8 @@ enum spdk_nvme_async_event_mask_bit {
 	SPDK_NVME_ASYNC_EVENT_DISCOVERY_LOG_CHANGE_MASK_BIT	= 2,
 	/* Mask Reservation Log Page Available Notification */
 	SPDK_NVME_ASYNC_EVENT_RESERVATION_LOG_AVAIL_MASK_BIT	= 3,
-
+	/* Mask Error Event */
+	SPDK_NVME_ASYNC_EVENT_ERROR_MASK_BIT			= 4,
 	/* 4 - 63 Reserved */
 };
 
@@ -1977,6 +1978,17 @@ nvmf_ctrlr_get_ana_state_from_nsid(struct spdk_nvmf_ctrlr *ctrlr, uint32_t nsid)
 	}
 
 	return nvmf_ctrlr_get_ana_state(ctrlr, ns->anagrpid);
+}
+
+static void
+nvmf_get_error_log_page(struct spdk_nvmf_ctrlr *ctrlr, struct iovec *iovs, int iovcnt,
+			uint64_t offset, uint32_t length, uint32_t rae)
+{
+	if (!rae) {
+		nvmf_ctrlr_unmask_aen(ctrlr, SPDK_NVME_ASYNC_EVENT_ERROR_MASK_BIT);
+	}
+
+	/* TODO: actually fill out log page data */
 }
 
 static void
@@ -2288,6 +2300,8 @@ nvmf_ctrlr_get_log_page(struct spdk_nvmf_request *req)
 	} else {
 		switch (lid) {
 		case SPDK_NVME_LOG_ERROR:
+			nvmf_get_error_log_page(ctrlr, req->iov, req->iovcnt, offset, len, rae);
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 		case SPDK_NVME_LOG_HEALTH_INFORMATION:
 			/* TODO: actually fill out log page data */
 			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
@@ -3158,26 +3172,6 @@ nvmf_ctrlr_process_fabrics_cmd(struct spdk_nvmf_request *req)
 	}
 }
 
-static inline int
-nvmf_ctrlr_async_event_notification(struct spdk_nvmf_ctrlr *ctrlr,
-				    union spdk_nvme_async_event_completion *event)
-{
-	struct spdk_nvmf_request *req;
-	struct spdk_nvme_cpl *rsp;
-
-	assert(ctrlr->nr_aer_reqs > 0);
-
-	req = ctrlr->aer_req[--ctrlr->nr_aer_reqs];
-	rsp = &req->rsp->nvme_cpl;
-
-	rsp->cdw0 = event->raw;
-
-	_nvmf_request_complete(req);
-	ctrlr->aer_req[ctrlr->nr_aer_reqs] = NULL;
-
-	return 0;
-}
-
 static inline void
 nvmf_ctrlr_queue_pending_async_event(struct spdk_nvmf_ctrlr *ctrlr,
 				     union spdk_nvme_async_event_completion *event)
@@ -3191,6 +3185,33 @@ nvmf_ctrlr_queue_pending_async_event(struct spdk_nvmf_ctrlr *ctrlr,
 	}
 	nvmf_event->event.raw = event->raw;
 	STAILQ_INSERT_TAIL(&ctrlr->async_events, nvmf_event, link);
+}
+
+static inline int
+nvmf_ctrlr_async_event_notification(struct spdk_nvmf_ctrlr *ctrlr,
+				    union spdk_nvme_async_event_completion *event)
+{
+	struct spdk_nvmf_request *req;
+	struct spdk_nvme_cpl *rsp;
+
+	/* If there is no outstanding AER request, queue the event.  Then
+	 * if an AER is later submitted, this event can be sent as a
+	 * response.
+	 */
+	if (ctrlr->nr_aer_reqs == 0) {
+		nvmf_ctrlr_queue_pending_async_event(ctrlr, event);
+		return 0;
+	}
+
+	req = ctrlr->aer_req[--ctrlr->nr_aer_reqs];
+	rsp = &req->rsp->nvme_cpl;
+
+	rsp->cdw0 = event->raw;
+
+	_nvmf_request_complete(req);
+	ctrlr->aer_req[ctrlr->nr_aer_reqs] = NULL;
+
+	return 0;
 }
 
 int
@@ -3210,15 +3231,6 @@ nvmf_ctrlr_async_event_ns_notice(struct spdk_nvmf_ctrlr *ctrlr)
 	event.bits.async_event_type = SPDK_NVME_ASYNC_EVENT_TYPE_NOTICE;
 	event.bits.async_event_info = SPDK_NVME_ASYNC_EVENT_NS_ATTR_CHANGED;
 	event.bits.log_page_identifier = SPDK_NVME_LOG_CHANGED_NS_LIST;
-
-	/* If there is no outstanding AER request, queue the event.  Then
-	 * if an AER is later submitted, this event can be sent as a
-	 * response.
-	 */
-	if (ctrlr->nr_aer_reqs == 0) {
-		nvmf_ctrlr_queue_pending_async_event(ctrlr, &event);
-		return 0;
-	}
 
 	return nvmf_ctrlr_async_event_notification(ctrlr, &event);
 }
@@ -3241,15 +3253,6 @@ nvmf_ctrlr_async_event_ana_change_notice(struct spdk_nvmf_ctrlr *ctrlr)
 	event.bits.async_event_info = SPDK_NVME_ASYNC_EVENT_ANA_CHANGE;
 	event.bits.log_page_identifier = SPDK_NVME_LOG_ASYMMETRIC_NAMESPACE_ACCESS;
 
-	/* If there is no outstanding AER request, queue the event.  Then
-	 * if an AER is later submitted, this event can be sent as a
-	 * response.
-	 */
-	if (ctrlr->nr_aer_reqs == 0) {
-		nvmf_ctrlr_queue_pending_async_event(ctrlr, &event);
-		return 0;
-	}
-
 	return nvmf_ctrlr_async_event_notification(ctrlr, &event);
 }
 
@@ -3269,15 +3272,6 @@ nvmf_ctrlr_async_event_reservation_notification(struct spdk_nvmf_ctrlr *ctrlr)
 	event.bits.async_event_type = SPDK_NVME_ASYNC_EVENT_TYPE_IO;
 	event.bits.async_event_info = SPDK_NVME_ASYNC_EVENT_RESERVATION_LOG_AVAIL;
 	event.bits.log_page_identifier = SPDK_NVME_LOG_RESERVATION_NOTIFICATION;
-
-	/* If there is no outstanding AER request, queue the event.  Then
-	 * if an AER is later submitted, this event can be sent as a
-	 * response.
-	 */
-	if (ctrlr->nr_aer_reqs == 0) {
-		nvmf_ctrlr_queue_pending_async_event(ctrlr, &event);
-		return;
-	}
 
 	nvmf_ctrlr_async_event_notification(ctrlr, &event);
 }
@@ -3303,12 +3297,19 @@ nvmf_ctrlr_async_event_discovery_log_change_notice(struct spdk_nvmf_ctrlr *ctrlr
 	event.bits.async_event_info = SPDK_NVME_ASYNC_EVENT_DISCOVERY_LOG_CHANGE;
 	event.bits.log_page_identifier = SPDK_NVME_LOG_DISCOVERY;
 
-	/* If there is no outstanding AER request, queue the event.  Then
-	 * if an AER is later submitted, this event can be sent as a
-	 * response.
-	 */
-	if (ctrlr->nr_aer_reqs == 0) {
-		nvmf_ctrlr_queue_pending_async_event(ctrlr, &event);
+	return nvmf_ctrlr_async_event_notification(ctrlr, &event);
+}
+
+int
+nvmf_ctrlr_async_event_error_event(struct spdk_nvmf_ctrlr *ctrlr,
+				   union spdk_nvme_async_event_completion event)
+{
+	if (!nvmf_ctrlr_mask_aen(ctrlr, SPDK_NVME_ASYNC_EVENT_ERROR_MASK_BIT)) {
+		return 0;
+	}
+
+	if (event.bits.async_event_type != SPDK_NVME_ASYNC_EVENT_TYPE_ERROR ||
+	    event.bits.async_event_info > SPDK_NVME_ASYNC_EVENT_FW_IMAGE_LOAD) {
 		return 0;
 	}
 

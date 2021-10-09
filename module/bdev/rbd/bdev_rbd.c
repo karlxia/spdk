@@ -93,9 +93,10 @@ struct bdev_rbd_io_channel {
 };
 
 struct bdev_rbd_io {
-	struct	spdk_thread *submit_td;
-	enum	spdk_bdev_io_status status;
-	size_t	total_len;
+	struct			spdk_thread *submit_td;
+	enum			spdk_bdev_io_status status;
+	rbd_completion_t	comp;
+	size_t			total_len;
 };
 
 struct bdev_rbd_cluster {
@@ -396,9 +397,11 @@ static void
 bdev_rbd_io_complete(struct spdk_bdev_io *bdev_io, enum spdk_bdev_io_status status)
 {
 	struct bdev_rbd_io *rbd_io = (struct bdev_rbd_io *)bdev_io->driver_ctx;
+	struct spdk_thread *current_thread = spdk_get_thread();
 
 	rbd_io->status = status;
-	if (rbd_io->submit_td != NULL) {
+	assert(rbd_io->submit_td != NULL);
+	if (rbd_io->submit_td != current_thread) {
 		spdk_thread_send_msg(rbd_io->submit_td, _bdev_rbd_io_complete, rbd_io);
 	} else {
 		_bdev_rbd_io_complete(rbd_io);
@@ -410,36 +413,34 @@ bdev_rbd_start_aio(struct bdev_rbd *disk, struct spdk_bdev_io *bdev_io,
 		   struct iovec *iov, int iovcnt, uint64_t offset, size_t len)
 {
 	int ret;
-	rbd_completion_t comp;
-	struct bdev_rbd_io *rbd_io;
+	struct bdev_rbd_io *rbd_io = (struct bdev_rbd_io *)bdev_io->driver_ctx;
 	rbd_image_t image = disk->image;
 
 	ret = rbd_aio_create_completion(bdev_io, bdev_rbd_finish_aiocb,
-					&comp);
+					&rbd_io->comp);
 	if (ret < 0) {
 		goto err;
 	}
 
 	if (bdev_io->type == SPDK_BDEV_IO_TYPE_READ) {
-		rbd_io = (struct bdev_rbd_io *)bdev_io->driver_ctx;
 		rbd_io->total_len = len;
 		if (spdk_likely(iovcnt == 1)) {
-			ret = rbd_aio_read(image, offset, iov[0].iov_len, iov[0].iov_base, comp);
+			ret = rbd_aio_read(image, offset, iov[0].iov_len, iov[0].iov_base, rbd_io->comp);
 		} else {
-			ret = rbd_aio_readv(image, iov, iovcnt, offset, comp);
+			ret = rbd_aio_readv(image, iov, iovcnt, offset, rbd_io->comp);
 		}
 	} else if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
 		if (spdk_likely(iovcnt == 1)) {
-			ret = rbd_aio_write(image, offset, iov[0].iov_len, iov[0].iov_base, comp);
+			ret = rbd_aio_write(image, offset, iov[0].iov_len, iov[0].iov_base, rbd_io->comp);
 		} else {
-			ret = rbd_aio_writev(image, iov, iovcnt, offset, comp);
+			ret = rbd_aio_writev(image, iov, iovcnt, offset, rbd_io->comp);
 		}
 	} else if (bdev_io->type == SPDK_BDEV_IO_TYPE_FLUSH) {
-		ret = rbd_aio_flush(image, comp);
+		ret = rbd_aio_flush(image, rbd_io->comp);
 	}
 
 	if (ret < 0) {
-		rbd_aio_release(comp);
+		rbd_aio_release(rbd_io->comp);
 		goto err;
 	}
 
@@ -617,11 +618,10 @@ bdev_rbd_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io
 	struct bdev_rbd_io *rbd_io = (struct bdev_rbd_io *)bdev_io->driver_ctx;
 	struct bdev_rbd *disk = (struct bdev_rbd *)bdev_io->bdev->ctxt;
 
+	rbd_io->submit_td = submit_td;
 	if (disk->main_td != submit_td) {
-		rbd_io->submit_td = submit_td;
 		spdk_thread_send_msg(disk->main_td, _bdev_rbd_submit_request, bdev_io);
 	} else {
-		rbd_io->submit_td = NULL;
 		_bdev_rbd_submit_request(bdev_io);
 	}
 }

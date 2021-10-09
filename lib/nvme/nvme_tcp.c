@@ -3,6 +3,7 @@
  *
  *   Copyright (c) Intel Corporation. All rights reserved.
  *   Copyright (c) 2020 Mellanox Technologies LTD. All rights reserved.
+ *   Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  *   Redistribution and use in source and binary forms, with or without
  *   modification, are permitted provided that the following conditions
@@ -70,6 +71,7 @@ struct nvme_tcp_poll_group {
 	int64_t num_completions;
 
 	TAILQ_HEAD(, nvme_tcp_qpair) needs_poll;
+	struct spdk_nvme_tcp_stat stats;
 };
 
 /* NVMe TCP qpair extensions for spdk_nvme_qpair */
@@ -85,8 +87,8 @@ struct nvme_tcp_qpair {
 	struct nvme_tcp_pdu			*send_pdu; /* only for error pdu and init pdu */
 	struct nvme_tcp_pdu			*send_pdus; /* Used by tcp_reqs */
 	enum nvme_tcp_pdu_recv_state		recv_state;
-
 	struct nvme_tcp_req			*tcp_reqs;
+	struct spdk_nvme_tcp_stat		*stats;
 
 	uint16_t				num_entries;
 	uint16_t				async_complete;
@@ -127,6 +129,7 @@ struct nvme_tcp_req {
 	uint16_t				cid;
 	uint16_t				ttag;
 	uint32_t				datao;
+	uint32_t				expected_datao;
 	uint32_t				r2tl_remain;
 	uint32_t				active_r2ts;
 	/* Used to hold a value received from subsequent R2T while we are still
@@ -202,6 +205,7 @@ nvme_tcp_req_get(struct nvme_tcp_qpair *tqpair)
 	tcp_req->state = NVME_TCP_REQ_ACTIVE;
 	TAILQ_REMOVE(&tqpair->free_reqs, tcp_req, link);
 	tcp_req->datao = 0;
+	tcp_req->expected_datao = 0;
 	tcp_req->req = NULL;
 	tcp_req->in_capsule_data = false;
 	tcp_req->pdu_in_use = false;
@@ -351,6 +355,7 @@ nvme_tcp_ctrlr_delete_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_q
 	nvme_qpair_deinit(qpair);
 	tqpair = nvme_tcp_qpair(qpair);
 	nvme_tcp_free_reqs(tqpair);
+	free(tqpair->stats);
 	free(tqpair);
 
 	return 0;
@@ -383,7 +388,7 @@ _pdu_write_done(void *cb_arg, int err)
 {
 	struct nvme_tcp_pdu *pdu = cb_arg;
 	struct nvme_tcp_qpair *tqpair = pdu->qpair;
-	struct nvme_tcp_poll_group *pgroup = nvme_tcp_poll_group(tqpair->qpair.poll_group);
+	struct nvme_tcp_poll_group *pgroup;
 
 	/* If there are queued requests, we assume they are queued because they are waiting
 	 * for resources to be released. Those resources are almost certainly released in
@@ -391,7 +396,10 @@ _pdu_write_done(void *cb_arg, int err)
 	 * the qpair needs to be polled and we can't rely on another network event to make
 	 * that happen. Add it to a list of qpairs to poll regardless of network activity
 	 * here. */
-	if (pgroup && !STAILQ_EMPTY(&tqpair->qpair.queued_req) && !tqpair->needs_poll) {
+	if (tqpair->qpair.poll_group && !STAILQ_EMPTY(&tqpair->qpair.queued_req) &&
+	    !tqpair->needs_poll) {
+		pgroup = nvme_tcp_poll_group(tqpair->qpair.poll_group);
+
 		TAILQ_INSERT_TAIL(&pgroup->needs_poll, tqpair, link);
 		tqpair->needs_poll = true;
 	}
@@ -419,6 +427,7 @@ _tcp_write_pdu(struct nvme_tcp_pdu *pdu)
 	pdu->sock_req.cb_fn = _pdu_write_done;
 	pdu->sock_req.cb_arg = pdu;
 	TAILQ_INSERT_TAIL(&tqpair->send_queue, pdu, tailq);
+	tqpair->stats->submitted_requests++;
 	spdk_sock_writev_async(tqpair->sock, &pdu->sock_req);
 }
 
@@ -734,6 +743,7 @@ nvme_tcp_qpair_submit_request(struct spdk_nvme_qpair *qpair,
 
 	tcp_req = nvme_tcp_req_get(tqpair);
 	if (!tcp_req) {
+		tqpair->stats->queued_requests++;
 		/* Inform the upper layer to try again later. */
 		return -EAGAIN;
 	}
@@ -1073,7 +1083,7 @@ tcp_data_recv_crc32_done(void *cb_arg, int status)
 	tqpair = tcp_req->tqpair;
 	assert(tqpair != NULL);
 
-	if (!tqpair->needs_poll) {
+	if (tqpair->qpair.poll_group && !tqpair->needs_poll) {
 		pgroup = nvme_tcp_poll_group(tqpair->qpair.poll_group);
 		TAILQ_INSERT_TAIL(&pgroup->needs_poll, tqpair, link);
 		tqpair->needs_poll = true;
@@ -1112,9 +1122,12 @@ nvme_tcp_pdu_payload_handle(struct nvme_tcp_qpair *tqpair,
 
 	SPDK_DEBUGLOG(nvme, "enter\n");
 
+	tcp_req = pdu->req;
+	/* Increase the expected data offset */
+	tcp_req->expected_datao += pdu->data_len;
+
 	/* check data digest if need */
 	if (pdu->ddgst_enable) {
-		tcp_req = pdu->req;
 		tgroup = nvme_tcp_poll_group(tqpair->qpair.poll_group);
 		/* Only suport this limitated case for the first step */
 		if ((nvme_qpair_get_state(&tqpair->qpair) >= NVME_QPAIR_CONNECTED) &&
@@ -1321,8 +1334,8 @@ nvme_tcp_c2h_data_hdr_handle(struct nvme_tcp_qpair *tqpair, struct nvme_tcp_pdu 
 
 	}
 
-	SPDK_DEBUGLOG(nvme, "tcp_req(%p) on tqpair(%p): datao=%u, payload_size=%u\n",
-		      tcp_req, tqpair, tcp_req->datao, tcp_req->req->payload_size);
+	SPDK_DEBUGLOG(nvme, "tcp_req(%p) on tqpair(%p): expected_datao=%u, payload_size=%u\n",
+		      tcp_req, tqpair, tcp_req->expected_datao, tcp_req->req->payload_size);
 
 	if (spdk_unlikely((flags & SPDK_NVME_TCP_C2H_DATA_FLAGS_SUCCESS) &&
 			  !(flags & SPDK_NVME_TCP_C2H_DATA_FLAGS_LAST_PDU))) {
@@ -1339,9 +1352,9 @@ nvme_tcp_c2h_data_hdr_handle(struct nvme_tcp_qpair *tqpair, struct nvme_tcp_pdu 
 		goto end;
 	}
 
-	if (tcp_req->datao != c2h_data->datao) {
-		SPDK_ERRLOG("Invalid datao for tcp_req(%p), received datal(%u) != datao(%u) in tcp_req\n",
-			    tcp_req, c2h_data->datao, tcp_req->datao);
+	if (tcp_req->expected_datao != c2h_data->datao) {
+		SPDK_ERRLOG("Invalid datao for tcp_req(%p), received datal(%u) != expected datao(%u) in tcp_req\n",
+			    tcp_req, c2h_data->datao, tcp_req->expected_datao);
 		fes = SPDK_NVME_TCP_TERM_REQ_FES_INVALID_HEADER_FIELD;
 		error_offset = offsetof(struct spdk_nvme_tcp_c2h_data_hdr, datao);
 		goto end;
@@ -1818,6 +1831,7 @@ nvme_tcp_qpair_sock_cb(void *ctx, struct spdk_sock_group *group, struct spdk_soc
 
 	if (pgroup->num_completions >= 0 && num_completions >= 0) {
 		pgroup->num_completions += num_completions;
+		pgroup->stats.nvme_completions += num_completions;
 	} else {
 		pgroup->num_completions = -ENXIO;
 	}
@@ -1980,6 +1994,7 @@ nvme_tcp_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpa
 {
 	int rc = 0;
 	struct nvme_tcp_qpair *tqpair;
+	struct nvme_tcp_poll_group *tgroup;
 
 	tqpair = nvme_tcp_qpair(qpair);
 
@@ -1995,6 +2010,14 @@ nvme_tcp_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpa
 		if (rc) {
 			SPDK_ERRLOG("Unable to activate the tcp qpair.\n");
 			return rc;
+		}
+		tgroup = nvme_tcp_poll_group(qpair->poll_group);
+		tqpair->stats = &tgroup->stats;
+	} else {
+		tqpair->stats = calloc(1, sizeof(*tqpair->stats));
+		if (!tqpair->stats) {
+			SPDK_ERRLOG("tcp stats memory allocation failed\n");
+			return -ENOMEM;
 		}
 	}
 
@@ -2254,11 +2277,19 @@ static int
 nvme_tcp_poll_group_remove(struct spdk_nvme_transport_poll_group *tgroup,
 			   struct spdk_nvme_qpair *qpair)
 {
+	struct nvme_tcp_qpair *tqpair;
+	int rc = 0;
+
 	if (qpair->poll_group_tailq_head == &tgroup->connected_qpairs) {
-		return nvme_poll_group_disconnect_qpair(qpair);
+		rc = nvme_poll_group_disconnect_qpair(qpair);
 	}
 
-	return 0;
+	tqpair = nvme_tcp_qpair(qpair);
+	/* When qpair is deleted, stats are freed. free(NULL) is valid case, so just set
+	 * stats pointer to NULL */
+	tqpair->stats = NULL;
+
+	return rc;
 }
 
 static int64_t
@@ -2268,11 +2299,13 @@ nvme_tcp_poll_group_process_completions(struct spdk_nvme_transport_poll_group *t
 	struct nvme_tcp_poll_group *group = nvme_tcp_poll_group(tgroup);
 	struct spdk_nvme_qpair *qpair, *tmp_qpair;
 	struct nvme_tcp_qpair *tqpair, *tmp_tqpair;
+	int num_events;
 
 	group->completions_per_qpair = completions_per_qpair;
 	group->num_completions = 0;
+	group->stats.polls++;
 
-	spdk_sock_group_poll(group->sock_group);
+	num_events = spdk_sock_group_poll(group->sock_group);
 
 	STAILQ_FOREACH_SAFE(qpair, &tgroup->disconnected_qpairs, poll_group_stailq, tmp_qpair) {
 		disconnected_qpair_cb(qpair, tgroup->group->ctx);
@@ -2283,6 +2316,13 @@ nvme_tcp_poll_group_process_completions(struct spdk_nvme_transport_poll_group *t
 	TAILQ_FOREACH_SAFE(tqpair, &group->needs_poll, link, tmp_tqpair) {
 		nvme_tcp_qpair_sock_cb(&tqpair->qpair, group->sock_group, tqpair->sock);
 	}
+
+	if (spdk_unlikely(num_events < 0)) {
+		return num_events;
+	}
+
+	group->stats.idle_polls += !num_events;
+	group->stats.socket_completions += num_events;
 
 	return group->num_completions;
 }
@@ -2308,6 +2348,40 @@ nvme_tcp_poll_group_destroy(struct spdk_nvme_transport_poll_group *tgroup)
 	return 0;
 }
 
+static int
+nvme_tcp_poll_group_get_stats(struct spdk_nvme_transport_poll_group *tgroup,
+			      struct spdk_nvme_transport_poll_group_stat **_stats)
+{
+	struct nvme_tcp_poll_group *group;
+	struct spdk_nvme_transport_poll_group_stat *stats;
+
+	if (tgroup == NULL || _stats == NULL) {
+		SPDK_ERRLOG("Invalid stats or group pointer\n");
+		return -EINVAL;
+	}
+
+	group = nvme_tcp_poll_group(tgroup);
+
+	stats = calloc(1, sizeof(*stats));
+	if (!stats) {
+		SPDK_ERRLOG("Can't allocate memory for TCP stats\n");
+		return -ENOMEM;
+	}
+	stats->trtype = SPDK_NVME_TRANSPORT_TCP;
+	memcpy(&stats->tcp, &group->stats, sizeof(group->stats));
+
+	*_stats = stats;
+
+	return 0;
+}
+
+static void
+nvme_tcp_poll_group_free_stats(struct spdk_nvme_transport_poll_group *tgroup,
+			       struct spdk_nvme_transport_poll_group_stat *stats)
+{
+	free(stats);
+}
+
 const struct spdk_nvme_transport_ops tcp_ops = {
 	.name = "TCP",
 	.type = SPDK_NVME_TRANSPORT_TCP,
@@ -2320,6 +2394,10 @@ const struct spdk_nvme_transport_ops tcp_ops = {
 	.ctrlr_set_reg_8 = nvme_fabric_ctrlr_set_reg_8,
 	.ctrlr_get_reg_4 = nvme_fabric_ctrlr_get_reg_4,
 	.ctrlr_get_reg_8 = nvme_fabric_ctrlr_get_reg_8,
+	.ctrlr_set_reg_4_async = nvme_fabric_ctrlr_set_reg_4_async,
+	.ctrlr_set_reg_8_async = nvme_fabric_ctrlr_set_reg_8_async,
+	.ctrlr_get_reg_4_async = nvme_fabric_ctrlr_get_reg_4_async,
+	.ctrlr_get_reg_8_async = nvme_fabric_ctrlr_get_reg_8_async,
 
 	.ctrlr_get_max_xfer_size = nvme_tcp_ctrlr_get_max_xfer_size,
 	.ctrlr_get_max_sges = nvme_tcp_ctrlr_get_max_sges,
@@ -2344,6 +2422,8 @@ const struct spdk_nvme_transport_ops tcp_ops = {
 	.poll_group_remove = nvme_tcp_poll_group_remove,
 	.poll_group_process_completions = nvme_tcp_poll_group_process_completions,
 	.poll_group_destroy = nvme_tcp_poll_group_destroy,
+	.poll_group_get_stats = nvme_tcp_poll_group_get_stats,
+	.poll_group_free_stats = nvme_tcp_poll_group_free_stats,
 };
 
 SPDK_NVME_TRANSPORT_REGISTER(tcp, &tcp_ops);

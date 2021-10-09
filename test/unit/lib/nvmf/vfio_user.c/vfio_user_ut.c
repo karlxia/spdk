@@ -51,6 +51,8 @@ DEFINE_STUB(spdk_nvmf_subsystem_get_nqn, const char *,
 	    (const struct spdk_nvmf_subsystem *subsystem), NULL);
 DEFINE_STUB(spdk_bdev_get_block_size, uint32_t, (const struct spdk_bdev *bdev), 512);
 DEFINE_STUB_V(nvmf_ctrlr_abort_aer, (struct spdk_nvmf_ctrlr *ctrlr));
+DEFINE_STUB(nvmf_ctrlr_async_event_error_event, int, (struct spdk_nvmf_ctrlr *ctrlr,
+		union spdk_nvme_async_event_completion event), 0);
 
 static void *
 gpa_to_vva(void *prv, uint64_t addr, uint64_t len, int prot)
@@ -221,6 +223,42 @@ test_nvme_cmd_map_sgls(void)
 	spdk_free(sgls);
 }
 
+static void
+ut_transport_destroy_done_cb(void *cb_arg)
+{
+	int *done = cb_arg;
+	*done = 1;
+}
+
+static void
+test_nvmf_vfio_user_create_destroy(void)
+{
+	struct spdk_nvmf_transport *transport = NULL;
+	struct nvmf_vfio_user_transport *vu_transport = NULL;
+	struct nvmf_vfio_user_endpoint *endpoint = NULL;
+	struct spdk_nvmf_transport_opts opts = {};
+	int rc;
+	int done;
+
+	/* Initialize transport_specific NULL to avoid decoding json */
+	opts.transport_specific = NULL;
+
+	transport = nvmf_vfio_user_create(&opts);
+	CU_ASSERT(transport != NULL);
+
+	vu_transport = SPDK_CONTAINEROF(transport, struct nvmf_vfio_user_transport,
+					transport);
+	/* Allocate a endpoint for destroy */
+	endpoint = calloc(1, sizeof(*endpoint));
+	pthread_mutex_init(&endpoint->lock, NULL);
+	TAILQ_INSERT_TAIL(&vu_transport->endpoints, endpoint, link);
+	done = 0;
+
+	rc = nvmf_vfio_user_destroy(transport, ut_transport_destroy_done_cb, &done);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(done == 1);
+}
+
 int main(int argc, char **argv)
 {
 	CU_pSuite	suite = NULL;
@@ -233,6 +271,7 @@ int main(int argc, char **argv)
 
 	CU_ADD_TEST(suite, test_nvme_cmd_map_prps);
 	CU_ADD_TEST(suite, test_nvme_cmd_map_sgls);
+	CU_ADD_TEST(suite, test_nvmf_vfio_user_create_destroy);
 
 	CU_basic_set_mode(CU_BRM_VERBOSE);
 	CU_basic_run_tests();

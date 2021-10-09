@@ -570,17 +570,19 @@ function check_changelog() {
 }
 
 function check_json_rpc() {
-	local rc=1
+	local rc=0
 
+	echo -n "Checking that all RPCs are documented..."
 	while IFS='"' read -r _ rpc _; do
 		if ! grep -q "^### $rpc" doc/jsonrpc.md; then
 			echo "Missing JSON-RPC documentation for ${rpc}"
 			rc=1
-			continue
 		fi
-		rc=0
 	done < <(git grep -h -E "^SPDK_RPC_REGISTER\(" ':!test/*')
 
+	if [ $rc -eq 0 ]; then
+		echo " OK"
+	fi
 	return $rc
 }
 
@@ -602,6 +604,24 @@ function check_markdown_format() {
 		echo "You do not have markdownlint installed so .md files not being checked!"
 	fi
 
+	return $rc
+}
+
+function check_rpc_args() {
+	local rc=0
+
+	echo -n "Checking rpc.py argument option names..."
+	grep add_argument scripts/rpc.py | grep -oP "(?<=--)[a-z0-9\-\_]*(?=\')" | grep "_" > badargs.log
+
+	if [[ -s badargs.log ]]; then
+		echo "rpc.py arguments with underscores detected!"
+		cat badargs.log
+		echo "Please convert the underscores to dashes."
+		rc=1
+	else
+		echo " OK"
+	fi
+	rm -f badargs.log
 	return $rc
 }
 
@@ -633,5 +653,6 @@ check_bash_style || rc=1
 check_bash_static_analysis || rc=1
 check_changelog || rc=1
 check_json_rpc || rc=1
+check_rpc_args || rc=1
 
 exit $rc

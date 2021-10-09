@@ -118,6 +118,7 @@ def nvmf_create_transport(client, **params):
         abort_timeout_sec: Abort execution timeout value, in seconds (optional)
         no_wr_batching: Boolean flag to disable work requests batching - RDMA specific (optional)
         control_msg_num: The number of control messages per poll group - TCP specific (optional)
+        disable_mappable_bar0: disable client mmap() of BAR0 - VFIO-USER specific (optional)
     Returns:
         True or False
     """
@@ -133,9 +134,10 @@ def nvmf_create_transport(client, **params):
 
 
 @deprecated_alias('get_nvmf_transports')
-def nvmf_get_transports(client, tgt_name=None):
+def nvmf_get_transports(client, trtype=None, tgt_name=None):
     """Get list of NVMe-oF transports.
     Args:
+        trtype: Transport type (optional; if omitted, query all transports).
         tgt_name: name of the parent NVMe-oF target (optional).
 
     Returns:
@@ -145,9 +147,10 @@ def nvmf_get_transports(client, tgt_name=None):
     params = {}
 
     if tgt_name:
-        params = {
-            'tgt_name': tgt_name,
-        }
+        params['tgt_name'] = tgt_name
+
+    if trtype:
+        params['trtype'] = trtype
 
     return client.call('nvmf_get_transports', params)
 

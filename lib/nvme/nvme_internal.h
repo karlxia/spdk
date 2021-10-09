@@ -564,9 +564,19 @@ enum nvme_ctrlr_state {
 	NVME_CTRLR_STATE_READ_VS,
 
 	/**
+	 * Waiting for Version (VS) register to be read.
+	 */
+	NVME_CTRLR_STATE_READ_VS_WAIT_FOR_VS,
+
+	/**
 	 * Read Capabilities (CAP) register.
 	 */
 	NVME_CTRLR_STATE_READ_CAP,
+
+	/**
+	 * Waiting for Capabilities (CAP) register to be read.
+	 */
+	NVME_CTRLR_STATE_READ_CAP_WAIT_FOR_CAP,
 
 	/**
 	 * Check EN to prepare for controller initialization.
@@ -574,9 +584,29 @@ enum nvme_ctrlr_state {
 	NVME_CTRLR_STATE_CHECK_EN,
 
 	/**
+	 * Waiting for CC to be read as part of EN check.
+	 */
+	NVME_CTRLR_STATE_CHECK_EN_WAIT_FOR_CC,
+
+	/**
 	 * Waiting for CSTS.RDY to transition from 0 to 1 so that CC.EN may be set to 0.
 	 */
 	NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_1,
+
+	/**
+	 * Waiting for CSTS register to be read as part of waiting for CSTS.RDY = 1.
+	 */
+	NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_1_WAIT_FOR_CSTS,
+
+	/**
+	 * Disabling the controller by setting CC.EN to 0.
+	 */
+	NVME_CTRLR_STATE_SET_EN_0,
+
+	/**
+	 * Waiting for the CC register to be read as part of disabling the controller.
+	 */
+	NVME_CTRLR_STATE_SET_EN_0_WAIT_FOR_CC,
 
 	/**
 	 * Waiting for CSTS.RDY to transition from 1 to 0 so that CC.EN may be set to 1.
@@ -584,14 +614,29 @@ enum nvme_ctrlr_state {
 	NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_0,
 
 	/**
+	 * Waiting for CSTS register to be read as part of waiting for CSTS.RDY = 0.
+	 */
+	NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_0_WAIT_FOR_CSTS,
+
+	/**
 	 * Enable the controller by writing CC.EN to 1
 	 */
 	NVME_CTRLR_STATE_ENABLE,
 
 	/**
+	 * Waiting for CC register to be written as part of enabling the controller.
+	 */
+	NVME_CTRLR_STATE_ENABLE_WAIT_FOR_CC,
+
+	/**
 	 * Waiting for CSTS.RDY to transition from 0 to 1 after enabling the controller.
 	 */
 	NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1,
+
+	/**
+	 * Waiting for CSTS register to be read as part of waiting for CSTS.RDY = 1.
+	 */
+	NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1_WAIT_FOR_CSTS,
 
 	/**
 	 * Reset the Admin queue of the controller.
@@ -740,7 +785,8 @@ enum nvme_ctrlr_state {
 	NVME_CTRLR_STATE_ERROR
 };
 
-#define NVME_TIMEOUT_INFINITE	0
+#define NVME_TIMEOUT_INFINITE		0
+#define NVME_TIMEOUT_KEEP_EXISTING	UINT64_MAX
 
 struct spdk_nvme_ctrlr_aer_completion_list {
 	struct spdk_nvme_cpl	cpl;
@@ -787,6 +833,13 @@ struct spdk_nvme_ctrlr_process {
 	STAILQ_HEAD(, spdk_nvme_ctrlr_aer_completion_list)      async_events;
 };
 
+struct nvme_register_completion {
+	struct spdk_nvme_cpl			cpl;
+	uint64_t				value;
+	spdk_nvme_reg_cb			cb_fn;
+	void					*cb_ctx;
+	STAILQ_ENTRY(nvme_register_completion)	stailq;
+};
 
 /*
  * One of these per allocated PCI device.
@@ -938,6 +991,11 @@ struct spdk_nvme_ctrlr {
 	unsigned int			fw_size_remaining;
 	unsigned int			fw_offset;
 	unsigned int			fw_transfer_size;
+
+	/* Completed register operations */
+	STAILQ_HEAD(, nvme_register_completion)	register_operations;
+
+	union spdk_nvme_cc_register		process_init_cc;
 };
 
 struct spdk_nvme_probe_ctx {
@@ -951,12 +1009,21 @@ struct spdk_nvme_probe_ctx {
 
 typedef void (*nvme_ctrlr_detach_cb)(struct spdk_nvme_ctrlr *ctrlr);
 
+enum nvme_ctrlr_detach_state {
+	NVME_CTRLR_DETACH_SET_CC,
+	NVME_CTRLR_DETACH_CHECK_CSTS,
+	NVME_CTRLR_DETACH_GET_CSTS,
+	NVME_CTRLR_DETACH_GET_CSTS_DONE,
+};
+
 struct nvme_ctrlr_detach_ctx {
 	struct spdk_nvme_ctrlr			*ctrlr;
 	nvme_ctrlr_detach_cb			cb_fn;
 	uint64_t				shutdown_start_tsc;
 	uint32_t				shutdown_timeout_ms;
 	bool					shutdown_complete;
+	enum nvme_ctrlr_detach_state		state;
+	union spdk_nvme_csts_register		csts;
 	TAILQ_ENTRY(nvme_ctrlr_detach_ctx)	link;
 };
 
@@ -1122,7 +1189,8 @@ void	nvme_qpair_complete_error_reqs(struct spdk_nvme_qpair *qpair);
 int	nvme_qpair_submit_request(struct spdk_nvme_qpair *qpair,
 				  struct nvme_request *req);
 void	nvme_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr);
-uint32_t nvme_qpair_abort_queued_reqs(struct spdk_nvme_qpair *qpair, void *cmd_cb_arg);
+uint32_t nvme_qpair_abort_queued_reqs_with_cbarg(struct spdk_nvme_qpair *qpair, void *cmd_cb_arg);
+void	nvme_qpair_abort_queued_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr);
 void	nvme_qpair_resubmit_requests(struct spdk_nvme_qpair *qpair, uint32_t num_requests);
 int	nvme_ctrlr_identify_active_ns(struct spdk_nvme_ctrlr *ctrlr);
 void	nvme_ns_set_identify_data(struct spdk_nvme_ns *ns);
@@ -1148,8 +1216,16 @@ int nvme_ns_cmd_zone_appendv_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_q
 int	nvme_fabric_ctrlr_set_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t value);
 int	nvme_fabric_ctrlr_set_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t value);
 int	nvme_fabric_ctrlr_get_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t *value);
-int	nvme_fabric_ctrlr_scan(struct spdk_nvme_probe_ctx *probe_ctx, bool direct_connect);
 int	nvme_fabric_ctrlr_get_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t *value);
+int	nvme_fabric_ctrlr_set_reg_4_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
+		uint32_t value, spdk_nvme_reg_cb cb_fn, void *cb_arg);
+int	nvme_fabric_ctrlr_set_reg_8_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
+		uint64_t value, spdk_nvme_reg_cb cb_fn, void *cb_arg);
+int	nvme_fabric_ctrlr_get_reg_4_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
+		spdk_nvme_reg_cb cb_fn, void *cb_arg);
+int	nvme_fabric_ctrlr_get_reg_8_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
+		spdk_nvme_reg_cb cb_fn, void *cb_arg);
+int	nvme_fabric_ctrlr_scan(struct spdk_nvme_probe_ctx *probe_ctx, bool direct_connect);
 int	nvme_fabric_ctrlr_discover(struct spdk_nvme_ctrlr *ctrlr,
 				   struct spdk_nvme_probe_ctx *probe_ctx);
 int	nvme_fabric_qpair_connect(struct spdk_nvme_qpair *qpair, uint32_t num_entries);
@@ -1392,6 +1468,14 @@ int nvme_transport_ctrlr_set_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offse
 int nvme_transport_ctrlr_set_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t value);
 int nvme_transport_ctrlr_get_reg_4(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint32_t *value);
 int nvme_transport_ctrlr_get_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, uint64_t *value);
+int nvme_transport_ctrlr_set_reg_4_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
+		uint32_t value, spdk_nvme_reg_cb cb_fn, void *cb_arg);
+int nvme_transport_ctrlr_set_reg_8_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
+		uint64_t value, spdk_nvme_reg_cb cb_fn, void *cb_arg);
+int nvme_transport_ctrlr_get_reg_4_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
+		spdk_nvme_reg_cb cb_fn, void *cb_arg);
+int nvme_transport_ctrlr_get_reg_8_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
+		spdk_nvme_reg_cb cb_fn, void *cb_arg);
 uint32_t nvme_transport_ctrlr_get_max_xfer_size(struct spdk_nvme_ctrlr *ctrlr);
 uint16_t nvme_transport_ctrlr_get_max_sges(struct spdk_nvme_ctrlr *ctrlr);
 struct spdk_nvme_qpair *nvme_transport_ctrlr_create_io_qpair(struct spdk_nvme_ctrlr *ctrlr,
@@ -1409,8 +1493,8 @@ int nvme_transport_ctrlr_connect_qpair(struct spdk_nvme_ctrlr *ctrlr,
 				       struct spdk_nvme_qpair *qpair);
 void nvme_transport_ctrlr_disconnect_qpair(struct spdk_nvme_ctrlr *ctrlr,
 		struct spdk_nvme_qpair *qpair);
-struct spdk_memory_domain *nvme_transport_ctrlr_get_memory_domain(const struct spdk_nvme_ctrlr
-		*ctrlr);
+int nvme_transport_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
+		struct spdk_memory_domain **domains, int array_size);
 void nvme_transport_qpair_abort_reqs(struct spdk_nvme_qpair *qpair, uint32_t dnr);
 int nvme_transport_qpair_reset(struct spdk_nvme_qpair *qpair);
 int nvme_transport_qpair_submit_request(struct spdk_nvme_qpair *qpair, struct nvme_request *req);

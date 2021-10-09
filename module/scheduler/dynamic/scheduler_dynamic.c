@@ -51,9 +51,19 @@ struct core_stats {
 
 static struct core_stats *g_cores;
 
-#define SCHEDULER_THREAD_BUSY 100
 #define SCHEDULER_LOAD_LIMIT 20
-#define SCHEDULER_CORE_LIMIT 95
+#define SCHEDULER_CORE_LIMIT 80
+#define SCHEDULER_CORE_BUSY 95
+
+static uint8_t
+_busy_pct(uint64_t busy, uint64_t idle)
+{
+	if ((busy + idle) == 0) {
+		return 0;
+	}
+
+	return busy * 100 / (busy + idle);
+}
 
 static uint8_t
 _get_thread_load(struct spdk_scheduler_thread_info *thread_info)
@@ -63,12 +73,8 @@ _get_thread_load(struct spdk_scheduler_thread_info *thread_info)
 	busy = thread_info->current_stats.busy_tsc;
 	idle = thread_info->current_stats.idle_tsc;
 
-	if (busy == 0) {
-		/* No work was done, exit before possible division by 0. */
-		return 0;
-	}
 	/* return percentage of time thread was busy */
-	return busy  * 100 / (busy + idle);
+	return _busy_pct(busy, idle);
 }
 
 typedef void (*_foreach_fn)(struct spdk_scheduler_thread_info *thread_info);
@@ -93,7 +99,8 @@ _move_thread(struct spdk_scheduler_thread_info *thread_info, uint32_t dst_core)
 	struct core_stats *dst = &g_cores[dst_core];
 	struct core_stats *src = &g_cores[thread_info->lcore];
 	uint64_t busy_tsc = thread_info->current_stats.busy_tsc;
-	uint64_t idle_tsc = thread_info->current_stats.idle_tsc;
+	uint8_t busy_pct = _busy_pct(src->busy, src->idle);
+	uint64_t tsc;
 
 	if (src == dst) {
 		/* Don't modify stats if thread is already on that core. */
@@ -104,10 +111,27 @@ _move_thread(struct spdk_scheduler_thread_info *thread_info, uint32_t dst_core)
 	dst->idle -= spdk_min(dst->idle, busy_tsc);
 	dst->thread_count++;
 
-	/* Decrease busy/idle from core as if thread was not present on it.
-	 * Core load will reflect the sum of all other threads on it. */
+	/* Adjust busy/idle from core as if thread was not present on it.
+	 * Core load will reflect the sum of all remaining threads on it. */
 	src->busy -= spdk_min(src->busy, busy_tsc);
-	src->idle -= spdk_min(src->idle, idle_tsc);
+	src->idle += spdk_min(UINT64_MAX - src->idle, busy_tsc);
+
+	if (busy_pct >= SCHEDULER_CORE_BUSY &&
+	    _busy_pct(src->busy, src->idle) < SCHEDULER_CORE_LIMIT) {
+		/* This core was so busy that we cannot assume all of busy_tsc
+		 * consumed by the moved thread will now be idle_tsc - it's
+		 * very possible the remaining threads will use these cycles
+		 * as busy_tsc.
+		 *
+		 * So make sure we don't drop the updated estimate below
+		 * SCHEDULER_CORE_LIMIT, so that other cores can't
+		 * move threads to this core during this scheduling
+		 * period.
+		 */
+		tsc = src->busy + src->idle;
+		src->busy = tsc * SCHEDULER_CORE_LIMIT / 100;
+		src->idle = tsc - src->busy;
+	}
 	assert(src->thread_count > 0);
 	src->thread_count--;
 
@@ -115,7 +139,7 @@ _move_thread(struct spdk_scheduler_thread_info *thread_info, uint32_t dst_core)
 }
 
 static bool
-_is_core_over_limit(uint32_t core_id)
+_is_core_at_limit(uint32_t core_id)
 {
 	struct core_stats *core = &g_cores[core_id];
 	uint64_t busy, idle;
@@ -134,7 +158,7 @@ _is_core_over_limit(uint32_t core_id)
 	}
 
 	/* Work done was less than the limit */
-	if (busy * 100 / (busy + idle) < SCHEDULER_CORE_LIMIT) {
+	if (_busy_pct(busy, idle) < SCHEDULER_CORE_LIMIT) {
 		return false;
 	}
 
@@ -145,6 +169,7 @@ static bool
 _can_core_fit_thread(struct spdk_scheduler_thread_info *thread_info, uint32_t dst_core)
 {
 	struct core_stats *dst = &g_cores[dst_core];
+	uint64_t new_busy_tsc, new_idle_tsc;
 
 	/* Thread can always fit on the core it's currently on. */
 	if (thread_info->lcore == dst_core) {
@@ -162,10 +187,17 @@ _can_core_fit_thread(struct spdk_scheduler_thread_info *thread_info, uint32_t ds
 		return true;
 	}
 
-	if (thread_info->current_stats.busy_tsc <= dst->idle) {
-		return true;
+	/* Core doesn't have enough idle_tsc to take this thread. */
+	if (dst->idle < thread_info->current_stats.busy_tsc) {
+		return false;
 	}
-	return false;
+
+	new_busy_tsc = dst->busy + thread_info->current_stats.busy_tsc;
+	new_idle_tsc = dst->idle - thread_info->current_stats.busy_tsc;
+
+	/* Core cannot fit this thread if it would put it over the
+	 * SCHEDULER_CORE_LIMIT. */
+	return _busy_pct(new_busy_tsc, new_idle_tsc) < SCHEDULER_CORE_LIMIT;
 }
 
 static uint32_t
@@ -176,7 +208,7 @@ _find_optimal_core(struct spdk_scheduler_thread_info *thread_info)
 	uint32_t least_busy_lcore = thread_info->lcore;
 	struct spdk_thread *thread;
 	struct spdk_cpuset *cpumask;
-	bool core_over_limit = _is_core_over_limit(current_lcore);
+	bool core_at_limit = _is_core_at_limit(current_lcore);
 
 	thread = spdk_thread_get_by_id(thread_info->thread_id);
 	if (thread == NULL) {
@@ -204,7 +236,7 @@ _find_optimal_core(struct spdk_scheduler_thread_info *thread_info)
 		if (i < current_lcore) {
 			/* Lower core id was found, move to consolidate threads on lowest core ids. */
 			return i;
-		} else if (core_over_limit) {
+		} else if (core_at_limit) {
 			/* When core is over the limit, even higher core ids are better than current one. */
 			return i;
 		}
@@ -212,7 +244,7 @@ _find_optimal_core(struct spdk_scheduler_thread_info *thread_info)
 
 	/* For cores over the limit, place the thread on least busy core
 	 * to balance threads. */
-	if (core_over_limit) {
+	if (core_at_limit) {
 		return least_busy_lcore;
 	}
 

@@ -149,7 +149,10 @@ struct nvmf_vfio_user_qpair {
 	struct spdk_nvme_cmd			create_io_sq_cmd;
 
 	TAILQ_HEAD(, nvmf_vfio_user_req)	reqs;
+	/* Poll group entry */
 	TAILQ_ENTRY(nvmf_vfio_user_qpair)	link;
+	/* Connected queue pair entry */
+	TAILQ_ENTRY(nvmf_vfio_user_qpair)	tailq;
 };
 
 struct nvmf_vfio_user_poll_group {
@@ -161,8 +164,8 @@ struct nvmf_vfio_user_ctrlr {
 	struct nvmf_vfio_user_endpoint		*endpoint;
 	struct nvmf_vfio_user_transport		*transport;
 
-	/* Number of connected queue pairs */
-	uint32_t				num_connected_qps;
+	/* Connected queue pairs list */
+	TAILQ_HEAD(, nvmf_vfio_user_qpair)	connected_qps;
 
 	struct spdk_thread			*thread;
 	struct spdk_poller			*vfu_ctx_poller;
@@ -540,7 +543,7 @@ nvmf_vfio_user_destroy(struct spdk_nvmf_transport *transport,
 
 static const struct spdk_json_object_decoder vfio_user_transport_opts_decoder[] = {
 	{
-		"disable-mappable-bar0",
+		"disable_mappable_bar0",
 		offsetof(struct nvmf_vfio_user_transport, transport_opts.disable_mappable_bar0),
 		spdk_json_decode_bool, true
 	},
@@ -903,7 +906,7 @@ lookup_io_q(struct nvmf_vfio_user_ctrlr *ctrlr, const uint16_t qid, const bool i
 
 	assert(ctrlr != NULL);
 
-	if (qid > NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR) {
+	if (qid == 0 || qid >= NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR) {
 		return NULL;
 	}
 
@@ -1107,7 +1110,7 @@ handle_create_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 	assert(cmd != NULL);
 
 	qid = cmd->cdw10_bits.create_io_q.qid;
-	if (qid >= NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR) {
+	if (qid == 0 || qid >= NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR) {
 		SPDK_ERRLOG("%s: invalid QID=%d, max=%d\n", ctrlr_id(ctrlr),
 			    qid, NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR);
 		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
@@ -1173,6 +1176,12 @@ handle_create_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 			SPDK_ERRLOG("%s: non-PC SQ not supported\n", ctrlr_id(ctrlr));
 			sc = SPDK_NVME_SC_INVALID_CONTROLLER_MEM_BUF;
 			goto out;
+		}
+		/* TODO: support shared IO CQ */
+		if (qid != cmd->cdw11_bits.create_io_sq.cqid) {
+			SPDK_ERRLOG("%s: doesn't support shared CQ now\n", ctrlr_id(ctrlr));
+			sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
 		}
 
 		io_q = &ctrlr->qp[qid]->sq;
@@ -1254,7 +1263,7 @@ handle_del_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 		      cmd->cdw10_bits.delete_io_q.qid);
 
 	if (lookup_io_q(ctrlr, cmd->cdw10_bits.delete_io_q.qid, is_cq) == NULL) {
-		SPDK_ERRLOG("%s: %cQ%d does not exist\n", ctrlr_id(ctrlr),
+		SPDK_ERRLOG("%s: I/O %cQ%d does not exist\n", ctrlr_id(ctrlr),
 			    is_cq ? 'C' : 'S', cmd->cdw10_bits.delete_io_q.qid);
 		sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
 		sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
@@ -1281,12 +1290,19 @@ handle_del_io_q(struct nvmf_vfio_user_ctrlr *ctrlr,
 		spdk_nvmf_qpair_disconnect(&vu_qpair->qpair, vfio_user_qpair_delete_cb, ctx);
 		return 0;
 	} else {
+		if (vu_qpair->state == VFIO_USER_QPAIR_DELETED) {
+			SPDK_DEBUGLOG(nvmf_vfio, "%s: SQ%u is already deleted\n", ctrlr_id(ctrlr),
+				      cmd->cdw10_bits.delete_io_q.qid);
+			sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			sc = SPDK_NVME_SC_INVALID_QUEUE_IDENTIFIER;
+			goto out;
+		}
+
 		/*
 		 * This doesn't actually delete the SQ, We're merely telling the poll_group_poll
 		 * function to skip checking this SQ.  The queue pair will be disconnected in Delete
 		 * IO CQ command.
 		 */
-		assert(vu_qpair->state == VFIO_USER_QPAIR_ACTIVE);
 		vu_qpair->state = VFIO_USER_QPAIR_DELETED;
 	}
 
@@ -1328,7 +1344,9 @@ handle_cmd_rsp(struct nvmf_vfio_user_req *vu_req, void *cb_arg)
 	assert(vu_req != NULL);
 	assert(vu_ctrlr != NULL);
 
-	vfu_unmap_sg(vu_ctrlr->endpoint->vfu_ctx, vu_req->sg, vu_req->iov, vu_req->iovcnt);
+	if (spdk_likely(vu_req->iovcnt)) {
+		vfu_unmap_sg(vu_ctrlr->endpoint->vfu_ctx, vu_req->sg, vu_req->iov, vu_req->iovcnt);
+	}
 	sqid = vu_qpair->qpair.qid;
 	cqid = vu_ctrlr->qp[sqid]->sq.cqid;
 
@@ -1419,7 +1437,7 @@ memory_region_add_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 	struct nvmf_vfio_user_endpoint *endpoint = vfu_get_private(vfu_ctx);
 	struct nvmf_vfio_user_ctrlr *ctrlr;
 	struct nvmf_vfio_user_qpair *qpair;
-	int i, ret;
+	int ret;
 
 	/*
 	 * We're not interested in any DMA regions that aren't mappable (we don't
@@ -1460,12 +1478,8 @@ memory_region_add_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 		}
 	}
 
-	for (i = 0; i < NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
-		qpair = ctrlr->qp[i];
-		if (qpair == NULL) {
-			continue;
-		}
-
+	pthread_mutex_lock(&endpoint->lock);
+	TAILQ_FOREACH(qpair, &ctrlr->connected_qps, tailq) {
 		if (qpair->state != VFIO_USER_QPAIR_INACTIVE) {
 			continue;
 		}
@@ -1475,19 +1489,19 @@ memory_region_add_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 			continue;
 		}
 		qpair->state = VFIO_USER_QPAIR_ACTIVE;
-		SPDK_DEBUGLOG(nvmf_vfio, "Remap QP %u successfully\n", i);
+		SPDK_DEBUGLOG(nvmf_vfio, "Remap QP %u successfully\n", qpair->qpair.qid);
 	}
+	pthread_mutex_unlock(&endpoint->lock);
 }
 
 static int
 memory_region_remove_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 {
-
 	struct nvmf_vfio_user_endpoint *endpoint = vfu_get_private(vfu_ctx);
 	struct nvmf_vfio_user_ctrlr *ctrlr;
 	struct nvmf_vfio_user_qpair *qpair;
 	void *map_start, *map_end;
-	int i, ret;
+	int ret = 0;
 
 	if (!info->vaddr) {
 		return 0;
@@ -1511,6 +1525,22 @@ memory_region_remove_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 		      (uintptr_t)info->mapping.iov_base,
 		      (uintptr_t)info->mapping.iov_base + info->mapping.iov_len);
 
+	map_start = info->mapping.iov_base;
+	map_end = info->mapping.iov_base + info->mapping.iov_len;
+
+	pthread_mutex_lock(&endpoint->lock);
+	TAILQ_FOREACH(qpair, &ctrlr->connected_qps, tailq) {
+		if ((qpair->cq.addr >= map_start && qpair->cq.addr <= map_end) ||
+		    (qpair->sq.addr >= map_start && qpair->sq.addr <= map_end)) {
+			/* TODO: Ideally we should disconnect this queue pair
+			 * before returning to caller.
+			 */
+			unmap_qp(qpair);
+			qpair->state = VFIO_USER_QPAIR_INACTIVE;
+		}
+	}
+	pthread_mutex_unlock(&endpoint->lock);
+
 	if (info->prot == (PROT_WRITE | PROT_READ)) {
 		ret = spdk_mem_unregister(info->mapping.iov_base, info->mapping.iov_len);
 		if (ret) {
@@ -1518,21 +1548,6 @@ memory_region_remove_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 				    (uint64_t)(uintptr_t)info->mapping.iov_base,
 				    (uint64_t)(uintptr_t)info->mapping.iov_base + info->mapping.iov_len,
 				    ret);
-		}
-	}
-
-	map_start = info->mapping.iov_base;
-	map_end = info->mapping.iov_base + info->mapping.iov_len;
-	for (i = 0; i < NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
-		qpair = ctrlr->qp[i];
-		if (qpair == NULL) {
-			continue;
-		}
-
-		if ((qpair->cq.addr >= map_start && qpair->cq.addr < map_end) ||
-		    (qpair->sq.addr >= map_start && qpair->sq.addr < map_end)) {
-			unmap_qp(qpair);
-			qpair->state = VFIO_USER_QPAIR_INACTIVE;
 		}
 	}
 
@@ -1636,7 +1651,7 @@ handle_dbl_access(struct nvmf_vfio_user_ctrlr *ctrlr, uint32_t *buf,
 	/* convert byte offset to array index */
 	pos >>= 2;
 
-	if (pos > NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR * 2) {
+	if (pos >= NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR * 2) {
 		SPDK_ERRLOG("%s: bad doorbell index %#lx\n", ctrlr_id(ctrlr), pos);
 		errno = EINVAL;
 		return -1;
@@ -1935,22 +1950,24 @@ static void
 _free_ctrlr(void *ctx)
 {
 	struct nvmf_vfio_user_ctrlr *ctrlr = ctx;
-	int i;
-
-	for (i = 0; i < NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
-		free_qp(ctrlr, i);
-	}
 
 	spdk_poller_unregister(&ctrlr->vfu_ctx_poller);
 	free(ctrlr);
 }
 
 static void
-free_ctrlr(struct nvmf_vfio_user_ctrlr *ctrlr)
+free_ctrlr(struct nvmf_vfio_user_ctrlr *ctrlr, bool free_qps)
 {
+	int i;
 	assert(ctrlr != NULL);
 
 	SPDK_DEBUGLOG(nvmf_vfio, "free %s\n", ctrlr_id(ctrlr));
+
+	if (free_qps) {
+		for (i = 0; i < NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
+			free_qp(ctrlr, i);
+		}
+	}
 
 	if (ctrlr->thread == spdk_get_thread()) {
 		_free_ctrlr(ctrlr);
@@ -1964,7 +1981,7 @@ nvmf_vfio_user_create_ctrlr(struct nvmf_vfio_user_transport *transport,
 			    struct nvmf_vfio_user_endpoint *endpoint)
 {
 	struct nvmf_vfio_user_ctrlr *ctrlr;
-	int err;
+	int err = 0;
 
 	/* First, construct a vfio-user CUSTOM transport controller */
 	ctrlr = calloc(1, sizeof(*ctrlr));
@@ -1976,10 +1993,12 @@ nvmf_vfio_user_create_ctrlr(struct nvmf_vfio_user_transport *transport,
 	ctrlr->transport = transport;
 	ctrlr->endpoint = endpoint;
 	ctrlr->doorbells = endpoint->doorbells;
+	TAILQ_INIT(&ctrlr->connected_qps);
 
 	/* Then, construct an admin queue pair */
 	err = init_qp(ctrlr, &transport->transport, NVMF_VFIO_USER_DEFAULT_AQ_DEPTH, 0);
 	if (err != 0) {
+		free(ctrlr);
 		goto out;
 	}
 	endpoint->ctrlr = ctrlr;
@@ -1991,7 +2010,6 @@ out:
 	if (err != 0) {
 		SPDK_ERRLOG("%s: failed to create vfio-user controller: %s\n",
 			    endpoint_id(endpoint), strerror(-err));
-		free_ctrlr(ctrlr);
 	}
 }
 
@@ -2103,7 +2121,10 @@ nvmf_vfio_user_stop_listen(struct spdk_nvmf_transport *transport,
 		if (strcmp(trid->traddr, endpoint->trid.traddr) == 0) {
 			TAILQ_REMOVE(&vu_transport->endpoints, endpoint, link);
 			if (endpoint->ctrlr) {
-				free_ctrlr(endpoint->ctrlr);
+				/* Users may kill NVMeoF target while VM
+				 * is connected, free all resources.
+				 */
+				free_ctrlr(endpoint->ctrlr, true);
 			}
 			nvmf_vfio_user_destroy_endpoint(endpoint);
 			pthread_mutex_unlock(&vu_transport->lock);
@@ -2254,9 +2275,9 @@ vfio_user_qpair_disconnect_cb(void *ctx)
 		return;
 	}
 
-	if (!ctrlr->num_connected_qps) {
+	if (TAILQ_EMPTY(&ctrlr->connected_qps)) {
 		endpoint->ctrlr = NULL;
-		free_ctrlr(ctrlr);
+		free_ctrlr(ctrlr, false);
 		pthread_mutex_unlock(&endpoint->lock);
 		return;
 	}
@@ -2266,7 +2287,6 @@ vfio_user_qpair_disconnect_cb(void *ctx)
 static int
 vfio_user_destroy_ctrlr(struct nvmf_vfio_user_ctrlr *ctrlr)
 {
-	uint32_t i;
 	struct nvmf_vfio_user_qpair *qpair;
 	struct nvmf_vfio_user_endpoint *endpoint;
 
@@ -2276,21 +2296,17 @@ vfio_user_destroy_ctrlr(struct nvmf_vfio_user_ctrlr *ctrlr)
 	assert(endpoint != NULL);
 
 	pthread_mutex_lock(&endpoint->lock);
-	if (ctrlr->num_connected_qps == 0) {
+	if (TAILQ_EMPTY(&ctrlr->connected_qps)) {
 		endpoint->ctrlr = NULL;
-		free_ctrlr(ctrlr);
+		free_ctrlr(ctrlr, false);
 		pthread_mutex_unlock(&endpoint->lock);
 		return 0;
 	}
-	pthread_mutex_unlock(&endpoint->lock);
 
-	for (i = 0; i < NVMF_VFIO_USER_DEFAULT_MAX_QPAIRS_PER_CTRLR; i++) {
-		qpair = ctrlr->qp[i];
-		if (qpair == NULL) {
-			continue;
-		}
+	TAILQ_FOREACH(qpair, &ctrlr->connected_qps, tailq) {
 		spdk_nvmf_qpair_disconnect(&qpair->qpair, vfio_user_qpair_disconnect_cb, endpoint);
 	}
+	pthread_mutex_unlock(&endpoint->lock);
 
 	return 0;
 }
@@ -2343,7 +2359,7 @@ handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 	if (spdk_nvme_cpl_is_error(&req->req.rsp->nvme_cpl)) {
 		SPDK_ERRLOG("SC %u, SCT %u\n", req->req.rsp->nvme_cpl.status.sc, req->req.rsp->nvme_cpl.status.sct);
 		endpoint->ctrlr = NULL;
-		free_ctrlr(ctrlr);
+		free_ctrlr(ctrlr, true);
 		return -1;
 	}
 
@@ -2364,7 +2380,7 @@ handle_queue_connect_rsp(struct nvmf_vfio_user_req *req, void *cb_arg)
 		post_completion(ctrlr, &ctrlr->qp[0]->cq, 0, 0,
 				qpair->create_io_sq_cmd.cid, SPDK_NVME_SC_SUCCESS, SPDK_NVME_SCT_GENERIC);
 	}
-	ctrlr->num_connected_qps++;
+	TAILQ_INSERT_TAIL(&ctrlr->connected_qps, qpair, tailq);
 	pthread_mutex_unlock(&endpoint->lock);
 
 	free(req->req.data);
@@ -2457,8 +2473,7 @@ nvmf_vfio_user_poll_group_remove(struct spdk_nvmf_transport_poll_group *group,
 	TAILQ_REMOVE(&vu_group->qps, vu_qpair, link);
 
 	pthread_mutex_lock(&endpoint->lock);
-	assert(vu_ctrlr->num_connected_qps);
-	vu_ctrlr->num_connected_qps--;
+	TAILQ_REMOVE(&vu_ctrlr->connected_qps, vu_qpair, tailq);
 	pthread_mutex_unlock(&endpoint->lock);
 
 	return 0;
@@ -2719,11 +2734,16 @@ handle_cmd_req(struct nvmf_vfio_user_ctrlr *ctrlr, struct spdk_nvme_cmd *cmd,
 	}
 
 	if (spdk_unlikely(err < 0)) {
+		struct nvmf_vfio_user_qpair *vu_qpair;
+
 		SPDK_ERRLOG("%s: process NVMe command opc 0x%x failed\n",
 			    ctrlr_id(ctrlr), cmd->opc);
 		req->rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		req->rsp->nvme_cpl.status.sct = SPDK_NVME_SCT_GENERIC;
-		return handle_cmd_rsp(vu_req, vu_req->cb_arg);
+		err = handle_cmd_rsp(vu_req, vu_req->cb_arg);
+		vu_qpair = SPDK_CONTAINEROF(req->qpair, struct nvmf_vfio_user_qpair, qpair);
+		_nvmf_vfio_user_req_free(vu_qpair, vu_req);
+		return err;
 	}
 
 	vu_req->state = VFIO_USER_REQUEST_STATE_EXECUTING;
@@ -2744,7 +2764,29 @@ nvmf_vfio_user_qpair_poll(struct nvmf_vfio_user_qpair *qpair)
 
 	ctrlr = qpair->ctrlr;
 
+	/* Load-Acquire. */
 	new_tail = *tdbl(ctrlr, &qpair->sq);
+
+	/*
+	 * Ensure that changes to the queue are visible to us.
+	 * The host driver should write the queue first, do a wmb(), and then
+	 * update the SQ tail doorbell (their Store-Release).
+	 */
+	spdk_rmb();
+
+	new_tail = new_tail & 0xffffu;
+	if (spdk_unlikely(new_tail >= qpair->sq.size)) {
+		union spdk_nvme_async_event_completion event = {};
+
+		SPDK_DEBUGLOG(nvmf_vfio, "%s: invalid SQ%u doorbell value %u\n", ctrlr_id(ctrlr), qpair->qpair.qid,
+			      new_tail);
+		event.bits.async_event_type = SPDK_NVME_ASYNC_EVENT_TYPE_ERROR;
+		event.bits.async_event_info = SPDK_NVME_ASYNC_EVENT_INVALID_DB_WRITE;
+		nvmf_ctrlr_async_event_error_event(qpair->qpair.ctrlr, event);
+
+		return 0;
+	}
+
 	if (sq_head(qpair) == new_tail) {
 		return 0;
 	}

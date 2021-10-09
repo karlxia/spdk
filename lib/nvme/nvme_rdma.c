@@ -2165,6 +2165,24 @@ nvme_rdma_conditional_fail_qpair(struct nvme_rdma_qpair *rqpair, struct nvme_rdm
 	nvme_rdma_fail_qpair(&rqpair->qpair, 0);
 }
 
+static inline void
+nvme_rdma_log_wc_status(struct nvme_rdma_qpair *rqpair, struct ibv_wc *wc)
+{
+	struct nvme_rdma_wr *rdma_wr = (struct nvme_rdma_wr *)wc->wr_id;
+
+	if (wc->status == IBV_WC_WR_FLUSH_ERR) {
+		/* If qpair is in ERR state, we will receive completions for all posted and not completed
+		 * Work Requests with IBV_WC_WR_FLUSH_ERR status. Don't log an error in that case */
+		SPDK_DEBUGLOG(nvme, "WC error, qid %u, qp state %d, request 0x%lu type %d, status: (%d): %s\n",
+			      rqpair->qpair.id, rqpair->qpair.state, wc->wr_id, rdma_wr->type, wc->status,
+			      ibv_wc_status_str(wc->status));
+	} else {
+		SPDK_ERRLOG("WC error, qid %u, qp state %d, request 0x%lu type %d, status: (%d): %s\n",
+			    rqpair->qpair.id, rqpair->qpair.state, wc->wr_id, rdma_wr->type, wc->status,
+			    ibv_wc_status_str(wc->status));
+	}
+}
+
 static int
 nvme_rdma_cq_process_completions(struct ibv_cq *cq, uint32_t batch_size,
 				 struct nvme_rdma_poll_group *group,
@@ -2199,8 +2217,7 @@ nvme_rdma_cq_process_completions(struct ibv_cq *cq, uint32_t batch_size,
 			rqpair->current_num_recvs--;
 
 			if (wc[i].status) {
-				SPDK_ERRLOG("CQ error on Queue Pair %p, Response Index %lu (%d): %s\n",
-					    rqpair, wc[i].wr_id, wc[i].status, ibv_wc_status_str(wc[i].status));
+				nvme_rdma_log_wc_status(rqpair, &wc[i]);
 				nvme_rdma_conditional_fail_qpair(rqpair, group);
 				completion_rc = -ENXIO;
 				continue;
@@ -2251,9 +2268,8 @@ nvme_rdma_cq_process_completions(struct ibv_cq *cq, uint32_t batch_size,
 				}
 				assert(rqpair->current_num_sends > 0);
 				rqpair->current_num_sends--;
+				nvme_rdma_log_wc_status(rqpair, &wc[i]);
 				nvme_rdma_conditional_fail_qpair(rqpair, group);
-				SPDK_ERRLOG("CQ error on Queue Pair %p, Response Index %lu (%d): %s\n",
-					    rqpair, wc[i].wr_id, wc[i].status, ibv_wc_status_str(wc[i].status));
 				completion_rc = -ENXIO;
 				continue;
 			}
@@ -2849,12 +2865,17 @@ nvme_rdma_poll_group_free_stats(struct spdk_nvme_transport_poll_group *tgroup,
 	free(stats);
 }
 
-static struct spdk_memory_domain *
-nvme_rdma_ctrlr_get_memory_domain(const struct spdk_nvme_ctrlr *ctrlr)
+static int
+nvme_rdma_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
+				   struct spdk_memory_domain **domains, int array_size)
 {
 	struct nvme_rdma_qpair *rqpair = nvme_rdma_qpair(ctrlr->adminq);
 
-	return rqpair->memory_domain->domain;
+	if (domains && array_size > 0) {
+		domains[0] = rqpair->memory_domain->domain;
+	}
+
+	return 1;
 }
 
 void
@@ -2884,7 +2905,7 @@ const struct spdk_nvme_transport_ops rdma_ops = {
 	.ctrlr_connect_qpair = nvme_rdma_ctrlr_connect_qpair,
 	.ctrlr_disconnect_qpair = nvme_rdma_ctrlr_disconnect_qpair,
 
-	.ctrlr_get_memory_domain = nvme_rdma_ctrlr_get_memory_domain,
+	.ctrlr_get_memory_domains = nvme_rdma_ctrlr_get_memory_domains,
 
 	.qpair_abort_reqs = nvme_rdma_qpair_abort_reqs,
 	.qpair_reset = nvme_rdma_qpair_reset,

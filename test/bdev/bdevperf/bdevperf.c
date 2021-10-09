@@ -389,6 +389,7 @@ bdevperf_test_done(void *ctx)
 	}
 
 	if (g_shutdown) {
+		g_shutdown_tsc = spdk_get_ticks() - g_shutdown_tsc;
 		g_time_in_usec = g_shutdown_tsc * 1000000 / spdk_get_ticks_hz();
 		printf("Received shutdown signal, test time was about %.6f seconds\n",
 		       (double)g_time_in_usec / 1000000);
@@ -1077,7 +1078,7 @@ bdevperf_test(void)
 
 	/* Start a timer to dump performance numbers */
 	g_shutdown_tsc = spdk_get_ticks();
-	if (g_show_performance_real_time) {
+	if (g_show_performance_real_time && !g_perf_timer) {
 		g_perf_timer = SPDK_POLLER_REGISTER(performance_statistics_thread, NULL,
 						    g_show_performance_period_in_usec);
 	}
@@ -1924,8 +1925,6 @@ spdk_bdevperf_shutdown_cb(void)
 		bdevperf_test_done(NULL);
 		return;
 	}
-
-	g_shutdown_tsc = spdk_get_ticks() - g_shutdown_tsc;
 
 	/* Iterate jobs to stop all I/O */
 	TAILQ_FOREACH_SAFE(job, &g_bdevperf.jobs, link, tmp) {

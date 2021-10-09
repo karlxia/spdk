@@ -43,8 +43,8 @@ function install_refspdk() {
 	if ((gcc_version >= 11)) && le "${release#v}" 21.04; then
 		git -C "$output_dir" config --global user.name "spdk"
 		git -C "$output_dir" config --global user.email "hotpatch@spdk.io"
-		curl -s https://github.com/spdk/spdk/commit/36b5a69bb0699694b53a2f08a13cc0de620450a9.patch | git -C "$output_dir" am
-		curl -s https://github.com/spdk/spdk/commit/2ac152158116a17b863270a4731977d9ddedf50d.patch | git -C "$output_dir" am
+		git -C "$output_dir" cherry-pick 36b5a69bb0699694b53a2f08a13cc0de620450a9
+		git -C "$output_dir" cherry-pick 2ac152158116a17b863270a4731977d9ddedf50d
 	fi
 
 	cat > $HOME/autorun-spdk.conf <<- EOF
@@ -81,14 +81,14 @@ function install_refspdk() {
 		# Prepare separate, fixed, cmdline for the FreeBSD, Issue #1397.
 		if [[ $OSID == freebsd ]]; then
 			config_params="--enable-debug"
-			config_params+=" --without-isal --with-fio=/usr/src/fio"
+			config_params+=" --without-isal"
 			config_params+=" --with-idxd --disable-unit-tests"
 
 			MAKE=gmake
 		else
 			config_params="$(get_config_params)"
 		fi
-		$output_dir/configure $(echo $config_params | sed 's/--enable-coverage//g')
+		$output_dir/configure $(echo $config_params | sed 's/--enable-coverage//g') --without-fio
 		if [[ $OSID != freebsd ]]; then
 			$MAKE -C $output_dir $MAKEFLAGS include/spdk/config.h
 			CONFIG_OCF_PATH="$output_dir/ocf" $MAKE -C $output_dir/lib/env_ocf $MAKEFLAGS exportlib O=$output_dir/ocf.a
@@ -195,7 +195,7 @@ function install_rocksdb() {
 function install_fio() {
 	# This version of fio is installed in /usr/src/fio to enable
 	# building the spdk fio plugin.
-	local fio_version="fio-3.19"
+	local fio_version="fio-3.28"
 
 	if [ ! -d /usr/src/fio ]; then
 		if [ ! -d fio ]; then
@@ -489,6 +489,14 @@ function install_ice() {
 	)
 }
 
+function install_lcov() {
+	local lcov_version=v1.15
+
+	rm -rf /usr/src/lcov
+	sudo git clone "$GIT_REPO_LCOV" --branch "$lcov_version" /usr/src/lcov
+	(cd /usr/src/lcov; sudo make install)
+}
+
 function install_sources() {
 	if [[ $ID == centos ]] && (( VERSION_ID == 7 )); then
 		# install proper version of the git first
@@ -514,6 +522,7 @@ function install_sources() {
 			install_qemu
 			install_igb_uio
 			install_ice
+			install_lcov
 		)
 		install_extra_pkgs
 	fi
@@ -576,6 +585,8 @@ export GIT_REPO_DPDK_KMODS
 export IRDMA_DRIVER
 : ${ICE_DRIVER="https://sourceforge.net/projects/e1000/files/ice stable/$ICE_VERSION/ice-$ICE_VERSION.tar.gz"}
 export ICE_DRIVER
+: ${GIT_REPO_LCOV=https://github.com/linux-test-project/lcov}
+export GIT_REPO_LCOV
 GIT_REPOS=${GIT_REPOS:-$HOME}
 
 gcc_version=$(gcc -dumpversion) gcc_version=${gcc_version%%.*}

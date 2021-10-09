@@ -2,6 +2,11 @@
 
 ## v21.10: (Upcoming Release)
 
+### idxd
+
+Added `spdk_idxd_get_socket` to query the socket that the idxd device
+is on.
+
 ### nvmf
 
 Added `oncs` to `struct spdk_nvmf_ctrlr_data` so that the transport layer
@@ -44,6 +49,10 @@ SoC may be running SPDK on the SoC. That SoC has its own local memory, but SPDK 
 devices that can also access the host system memory. This library provides infrastructure to enumerate
 the memory domains and request hardware perform DMA transfers between them.
 
+### event
+
+Added the `disable_signal_handlers` flag to the `spdk_app_opts` struct.
+
 ### log
 
 Added API `spdk_log_to_syslog_level` to return syslog level based on SPDK's
@@ -51,7 +60,10 @@ log level.
 
 ### nvme
 
-New API `spdk_nvme_ctrlr_get_memory_domain` has been added, it allows to get SPDK memory domain used by nvme controller.
+Added new functions `spdk_nvme_zns_set_zone_desc_ext` and `spdk_nvme_zns_ext_report_zones`
+to set zone descriptor extension and to get extended zone report respectively.
+
+New API `spdk_nvme_ctrlr_get_memory_domains` has been added, it allows to get SPDK memory domains used by nvme controller.
 
 New API functions `spdk_nvme_ns_cmd_readv_ext` and `spdk_nvme_ns_cmd_writev_ext`
 have been added. These functions accept `spdk_nvme_ns_cmd_ext_io_opts` structure with extended IO request
@@ -68,6 +80,10 @@ Added `spdk_nvme_ctrlr_get_opts` to retrieve the current controller options.
 ### dpdk
 
 Updated DPDK submodule to DPDK 21.08.
+
+### util
+
+The `spdk_fd_group_add` API now takes a `name` parameter.
 
 ## v21.07
 

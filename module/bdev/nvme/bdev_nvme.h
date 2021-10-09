@@ -40,8 +40,8 @@
 #include "spdk/nvme.h"
 #include "spdk/bdev_module.h"
 
-TAILQ_HEAD(nvme_ctrlrs, nvme_ctrlr);
-extern struct nvme_ctrlrs g_nvme_ctrlrs;
+TAILQ_HEAD(nvme_bdev_ctrlrs, nvme_bdev_ctrlr);
+extern struct nvme_bdev_ctrlrs g_nvme_bdev_ctrlrs;
 extern pthread_mutex_t g_bdev_nvme_mutex;
 extern bool g_bdev_nvme_module_finish;
 
@@ -67,15 +67,17 @@ struct nvme_async_probe_ctx {
 };
 
 struct nvme_ns {
-	uint32_t		id;
-	struct spdk_nvme_ns	*ns;
-	struct nvme_ctrlr	*ctrlr;
-	struct nvme_bdev	*bdev;
-	uint32_t		ana_group_id;
-	enum spdk_nvme_ana_state ana_state;
+	uint32_t			id;
+	struct spdk_nvme_ns		*ns;
+	struct nvme_ctrlr		*ctrlr;
+	struct nvme_bdev		*bdev;
+	uint32_t			ana_group_id;
+	enum spdk_nvme_ana_state	ana_state;
+	struct nvme_async_probe_ctx	*probe_ctx;
 };
 
 struct nvme_bdev_io;
+struct nvme_bdev_ctrlr;
 
 struct nvme_ctrlr_trid {
 	struct spdk_nvme_transport_id		trid;
@@ -92,8 +94,7 @@ struct nvme_ctrlr {
 	 *  target for CONTROLLER IDENTIFY command during initialization
 	 */
 	struct spdk_nvme_ctrlr			*ctrlr;
-	struct spdk_nvme_transport_id		*connected_trid;
-	char					*name;
+	struct nvme_ctrlr_trid			*connected_trid;
 	int					ref;
 	bool					resetting;
 	bool					failover_in_progress;
@@ -117,12 +118,15 @@ struct nvme_ctrlr {
 	bdev_nvme_reset_cb			reset_cb_fn;
 	void					*reset_cb_arg;
 	struct spdk_nvme_ctrlr_reset_ctx	*reset_ctx;
-	struct spdk_poller			*reset_poller;
+	/* Poller used to check for reset/detach completion */
+	struct spdk_poller			*reset_detach_poller;
+	struct spdk_nvme_detach_ctx		*detach_ctx;
 
 	/** linked list pointer for device list */
 	TAILQ_ENTRY(nvme_ctrlr)			tailq;
+	struct nvme_bdev_ctrlr			*nbdev_ctrlr;
 
-	TAILQ_HEAD(, nvme_ctrlr_trid)		trids;
+	TAILQ_HEAD(nvme_paths, nvme_ctrlr_trid)	trids;
 
 	uint32_t				ana_log_page_size;
 	struct spdk_nvme_ana_page		*ana_log_page;
@@ -133,10 +137,31 @@ struct nvme_ctrlr {
 	pthread_mutex_t				mutex;
 };
 
+struct nvme_bdev_ctrlr {
+	char				*name;
+	TAILQ_HEAD(, nvme_ctrlr)	ctrlrs;
+	TAILQ_ENTRY(nvme_bdev_ctrlr)	tailq;
+};
+
 struct nvme_bdev {
 	struct spdk_bdev	disk;
 	struct nvme_ns		*nvme_ns;
 	bool			opal;
+};
+
+struct nvme_ctrlr_channel {
+	struct spdk_nvme_qpair		*qpair;
+	struct nvme_poll_group		*group;
+	TAILQ_HEAD(, spdk_bdev_io)	pending_resets;
+	TAILQ_ENTRY(nvme_ctrlr_channel)	tailq;
+};
+
+#define nvme_ctrlr_channel_get_ctrlr(ctrlr_ch)	\
+	(struct nvme_ctrlr *)spdk_io_channel_get_io_device(spdk_io_channel_from_ctx(ctrlr_ch))
+
+struct nvme_bdev_channel {
+	struct nvme_ns			*nvme_ns;
+	struct nvme_ctrlr_channel	*ctrlr_ch;
 };
 
 struct nvme_poll_group {
@@ -147,21 +172,9 @@ struct nvme_poll_group {
 	uint64_t				spin_ticks;
 	uint64_t				start_ticks;
 	uint64_t				end_ticks;
+	TAILQ_HEAD(, nvme_ctrlr_channel)	ctrlr_ch_list;
 };
 
-struct nvme_ctrlr_channel {
-	struct nvme_ctrlr		*ctrlr;
-	struct spdk_nvme_qpair		*qpair;
-	struct nvme_poll_group		*group;
-	TAILQ_HEAD(, spdk_bdev_io)	pending_resets;
-};
-
-struct nvme_bdev_channel {
-	struct nvme_ns			*nvme_ns;
-	struct nvme_ctrlr_channel	*ctrlr_ch;
-};
-
-struct nvme_ctrlr *nvme_ctrlr_get(const struct spdk_nvme_transport_id *trid);
 struct nvme_ctrlr *nvme_ctrlr_get_by_name(const char *name);
 
 typedef void (*nvme_ctrlr_for_each_fn)(struct nvme_ctrlr *nvme_ctrlr, void *ctx);
@@ -170,13 +183,6 @@ void nvme_ctrlr_for_each(nvme_ctrlr_for_each_fn fn, void *ctx);
 
 void nvme_bdev_dump_trid_json(const struct spdk_nvme_transport_id *trid,
 			      struct spdk_json_write_ctx *w);
-
-void nvme_ctrlr_release(struct nvme_ctrlr *nvme_ctrlr);
-void nvme_ctrlr_unregister(void *ctx);
-void nvme_ctrlr_delete(struct nvme_ctrlr *nvme_ctrlr);
-
-int bdev_nvme_create_bdev_channel_cb(void *io_device, void *ctx_buf);
-void bdev_nvme_destroy_bdev_channel_cb(void *io_device, void *ctx_buf);
 
 struct nvme_ns *nvme_ctrlr_get_ns(struct nvme_ctrlr *nvme_ctrlr, uint32_t nsid);
 struct nvme_ns *nvme_ctrlr_get_first_active_ns(struct nvme_ctrlr *nvme_ctrlr);
@@ -208,17 +214,16 @@ struct spdk_nvme_qpair *bdev_nvme_get_io_qpair(struct spdk_io_channel *ctrlr_io_
 void bdev_nvme_get_opts(struct spdk_bdev_nvme_opts *opts);
 int bdev_nvme_set_opts(const struct spdk_bdev_nvme_opts *opts);
 int bdev_nvme_set_hotplug(bool enabled, uint64_t period_us, spdk_msg_fn cb, void *cb_ctx);
-int bdev_nvme_remove_trid(const char *name, struct spdk_nvme_transport_id *trid);
 
 int bdev_nvme_create(struct spdk_nvme_transport_id *trid,
-		     struct spdk_nvme_host_id *hostid,
 		     const char *base_name,
 		     const char **names,
 		     uint32_t count,
 		     uint32_t prchk_flags,
 		     spdk_bdev_create_nvme_fn cb_fn,
 		     void *cb_ctx,
-		     struct spdk_nvme_ctrlr_opts *opts);
+		     struct spdk_nvme_ctrlr_opts *opts,
+		     bool multipath);
 struct spdk_nvme_ctrlr *bdev_nvme_get_ctrlr(struct spdk_bdev *bdev);
 
 /**
@@ -238,8 +243,8 @@ int bdev_nvme_delete(const char *name, const struct spdk_nvme_transport_id *trid
  * \param cb_fn Function to be called back after reset completes
  * \param cb_arg Argument for callback function
  * \return zero on success. Negated errno on the following error conditions:
- * -EBUSY: controller is being destroyed.
- * -EAGAIN: controller is already being reset.
+ * -ENXIO: controller is being destroyed.
+ * -EBUSY: controller is already being reset.
  */
 int bdev_nvme_reset_rpc(struct nvme_ctrlr *nvme_ctrlr, bdev_nvme_reset_cb cb_fn, void *cb_arg);
 

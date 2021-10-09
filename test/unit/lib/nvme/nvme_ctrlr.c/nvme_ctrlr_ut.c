@@ -81,13 +81,16 @@ DEFINE_STUB(spdk_nvme_ctrlr_cmd_security_receive, int, (struct spdk_nvme_ctrlr *
 DEFINE_STUB(spdk_nvme_ctrlr_cmd_security_send, int, (struct spdk_nvme_ctrlr *ctrlr,
 		uint8_t secp, uint16_t spsp, uint8_t nssf, void *payload,
 		uint32_t payload_size, spdk_nvme_cmd_cb cb_fn, void *cb_arg), 0);
+DEFINE_STUB_V(nvme_qpair_abort_queued_reqs, (struct spdk_nvme_qpair *qpair, uint32_t dnr));
 
-DEFINE_RETURN_MOCK(nvme_transport_ctrlr_get_memory_domain, struct spdk_memory_domain *);
-struct spdk_memory_domain *
-nvme_transport_ctrlr_get_memory_domain(const struct spdk_nvme_ctrlr *ctrlr)
+DEFINE_RETURN_MOCK(nvme_transport_ctrlr_get_memory_domains, int);
+int
+nvme_transport_ctrlr_get_memory_domains(const struct spdk_nvme_ctrlr *ctrlr,
+					struct spdk_memory_domain **domains, int array_size)
 {
-	HANDLE_RETURN_MOCK(nvme_transport_ctrlr_get_memory_domain);
-	return NULL;
+	HANDLE_RETURN_MOCK(nvme_transport_ctrlr_get_memory_domains);
+
+	return 0;
 }
 
 struct spdk_nvme_ctrlr *nvme_transport_ctrlr_construct(const struct spdk_nvme_transport_id *trid,
@@ -146,6 +149,64 @@ nvme_transport_ctrlr_get_reg_8(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset, u
 {
 	SPDK_CU_ASSERT_FATAL(offset <= sizeof(struct spdk_nvme_registers) - 8);
 	*value = *(uint64_t *)((uintptr_t)&g_ut_nvme_regs + offset);
+	return 0;
+}
+
+int
+nvme_transport_ctrlr_set_reg_4_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
+				     uint32_t value, spdk_nvme_reg_cb cb_fn, void *cb_arg)
+{
+	struct spdk_nvme_cpl cpl = {};
+
+	cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+	cpl.status.sc = SPDK_NVME_SC_SUCCESS;
+
+	nvme_transport_ctrlr_set_reg_4(ctrlr, offset, value);
+	cb_fn(cb_arg, value, &cpl);
+	return 0;
+}
+
+int
+nvme_transport_ctrlr_set_reg_8_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
+				     uint64_t value, spdk_nvme_reg_cb cb_fn, void *cb_arg)
+{
+	struct spdk_nvme_cpl cpl = {};
+
+	cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+	cpl.status.sc = SPDK_NVME_SC_SUCCESS;
+
+	nvme_transport_ctrlr_set_reg_8(ctrlr, offset, value);
+	cb_fn(cb_arg, value, &cpl);
+	return 0;
+}
+
+int
+nvme_transport_ctrlr_get_reg_4_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
+				     spdk_nvme_reg_cb cb_fn, void *cb_arg)
+{
+	struct spdk_nvme_cpl cpl = {};
+	uint32_t value;
+
+	cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+	cpl.status.sc = SPDK_NVME_SC_SUCCESS;
+
+	nvme_transport_ctrlr_get_reg_4(ctrlr, offset, &value);
+	cb_fn(cb_arg, value, &cpl);
+	return 0;
+}
+
+int
+nvme_transport_ctrlr_get_reg_8_async(struct spdk_nvme_ctrlr *ctrlr, uint32_t offset,
+				     spdk_nvme_reg_cb cb_fn, void *cb_arg)
+{
+	struct spdk_nvme_cpl cpl = {};
+	uint64_t value;
+
+	cpl.status.sct = SPDK_NVME_SCT_GENERIC;
+	cpl.status.sc = SPDK_NVME_SC_SUCCESS;
+
+	nvme_transport_ctrlr_get_reg_8(ctrlr, offset, &value);
+	cb_fn(cb_arg, value, &cpl);
 	return 0;
 }
 
@@ -666,6 +727,8 @@ test_nvme_ctrlr_init_en_1_rdy_0(void)
 	 */
 	g_ut_nvme_regs.csts.bits.rdy = 1;
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) == 0);
+	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_SET_EN_0);
+	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) == 0);
 	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_DISABLE_WAIT_FOR_READY_0);
 	CU_ASSERT(g_ut_nvme_regs.cc.bits.en == 0);
 
@@ -719,7 +782,7 @@ test_nvme_ctrlr_init_en_1_rdy_1(void)
 	ctrlr.cdata.nn = 1;
 	ctrlr.page_size = 0x1000;
 	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_INIT);
-	while (ctrlr.state != NVME_CTRLR_STATE_CHECK_EN) {
+	while (ctrlr.state != NVME_CTRLR_STATE_SET_EN_0) {
 		CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) == 0);
 	}
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) == 0);
@@ -829,7 +892,6 @@ test_nvme_ctrlr_init_en_0_rdy_0_ams_rr(void)
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) == 0);
 	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_ENABLE);
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) != 0);
-	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1);
 	CU_ASSERT(g_ut_nvme_regs.cc.bits.en == 0);
 
 	/*
@@ -861,7 +923,6 @@ test_nvme_ctrlr_init_en_0_rdy_0_ams_rr(void)
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) == 0);
 	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_ENABLE);
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) != 0);
-	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1);
 	CU_ASSERT(g_ut_nvme_regs.cc.bits.en == 0);
 
 	/*
@@ -893,7 +954,6 @@ test_nvme_ctrlr_init_en_0_rdy_0_ams_rr(void)
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) == 0);
 	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_ENABLE);
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) != 0);
-	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1);
 	CU_ASSERT(g_ut_nvme_regs.cc.bits.en == 0);
 
 	/*
@@ -1053,7 +1113,6 @@ test_nvme_ctrlr_init_en_0_rdy_0_ams_wrr(void)
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) == 0);
 	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_ENABLE);
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) != 0);
-	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1);
 	CU_ASSERT(g_ut_nvme_regs.cc.bits.en == 0);
 
 	/*
@@ -1085,7 +1144,6 @@ test_nvme_ctrlr_init_en_0_rdy_0_ams_wrr(void)
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) == 0);
 	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_ENABLE);
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) != 0);
-	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1);
 	CU_ASSERT(g_ut_nvme_regs.cc.bits.en == 0);
 
 	/*
@@ -1210,7 +1268,6 @@ test_nvme_ctrlr_init_en_0_rdy_0_ams_vs(void)
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) == 0);
 	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_ENABLE);
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) != 0);
-	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1);
 	CU_ASSERT(g_ut_nvme_regs.cc.bits.en == 0);
 
 	/*
@@ -1276,7 +1333,6 @@ test_nvme_ctrlr_init_en_0_rdy_0_ams_vs(void)
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) == 0);
 	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_ENABLE);
 	CU_ASSERT(nvme_ctrlr_process_init(&ctrlr) != 0);
-	CU_ASSERT(ctrlr.state == NVME_CTRLR_STATE_ENABLE_WAIT_FOR_READY_1);
 	CU_ASSERT(g_ut_nvme_regs.cc.bits.en == 0);
 
 	/*
@@ -1525,7 +1581,7 @@ test_alloc_io_qpair_wrr_1(void)
 	 * Fake to simulate the controller with weighted round robin
 	 * arbitration mechanism.
 	 */
-	g_ut_nvme_regs.cc.bits.ams = SPDK_NVME_CC_AMS_WRR;
+	ctrlr.process_init_cc.bits.ams = SPDK_NVME_CC_AMS_WRR;
 
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(&ctrlr, &opts, sizeof(opts));
 
@@ -1579,7 +1635,7 @@ test_alloc_io_qpair_wrr_2(void)
 	 * Fake to simulate the controller with weighted round robin
 	 * arbitration mechanism.
 	 */
-	g_ut_nvme_regs.cc.bits.ams = SPDK_NVME_CC_AMS_WRR;
+	ctrlr.process_init_cc.bits.ams = SPDK_NVME_CC_AMS_WRR;
 
 	spdk_nvme_ctrlr_get_default_io_qpair_opts(&ctrlr, &opts, sizeof(opts));
 
@@ -3089,18 +3145,17 @@ test_nvme_ctrlr_ana_resize(void)
 }
 
 static void
-test_nvme_ctrlr_get_memory_domain(void)
+test_nvme_ctrlr_get_memory_domains(void)
 {
 	struct spdk_nvme_ctrlr ctrlr = {};
-	struct spdk_memory_domain *domain = (struct spdk_memory_domain *)0xbaadbeef;
 
-	MOCK_SET(nvme_transport_ctrlr_get_memory_domain, domain);
-	CU_ASSERT(spdk_nvme_ctrlr_get_memory_domain(&ctrlr) == domain);
+	MOCK_SET(nvme_transport_ctrlr_get_memory_domains, 1);
+	CU_ASSERT(spdk_nvme_ctrlr_get_memory_domains(&ctrlr, NULL, 0) == 1);
 
-	MOCK_SET(nvme_transport_ctrlr_get_memory_domain, NULL);
-	CU_ASSERT(spdk_nvme_ctrlr_get_memory_domain(&ctrlr) == NULL);
+	MOCK_SET(nvme_transport_ctrlr_get_memory_domains, 0);
+	CU_ASSERT(spdk_nvme_ctrlr_get_memory_domains(&ctrlr, NULL, 0) == 0);
 
-	MOCK_CLEAR(nvme_transport_ctrlr_get_memory_domain);
+	MOCK_CLEAR(nvme_transport_ctrlr_get_memory_domains);
 }
 
 int main(int argc, char **argv)
@@ -3155,7 +3210,7 @@ int main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvme_ctrlr_set_supported_log_pages);
 	CU_ADD_TEST(suite, test_nvme_ctrlr_parse_ana_log_page);
 	CU_ADD_TEST(suite, test_nvme_ctrlr_ana_resize);
-	CU_ADD_TEST(suite, test_nvme_ctrlr_get_memory_domain);
+	CU_ADD_TEST(suite, test_nvme_ctrlr_get_memory_domains);
 
 	CU_basic_set_mode(CU_BRM_VERBOSE);
 	CU_basic_run_tests();

@@ -3383,11 +3383,13 @@ enum spdk_nvme_zns_zone_send_action {
 	SPDK_NVME_ZONE_OPEN	= 0x3,
 	SPDK_NVME_ZONE_RESET	= 0x4,
 	SPDK_NVME_ZONE_OFFLINE	= 0x5,
+	SPDK_NVME_ZONE_SET_ZDE	= 0x10,
 };
 
 /* ZNS Zone Receive Action (ZRA) cdw13 */
 enum spdk_nvme_zns_zone_receive_action {
-	SPDK_NVME_ZONE_REPORT	= 0x0,
+	SPDK_NVME_ZONE_REPORT		= 0x0,
+	SPDK_NVME_ZONE_EXTENDED_REPORT	= 0x1,
 };
 
 enum spdk_nvme_zns_zra_report_opts {
@@ -3436,15 +3438,15 @@ struct spdk_nvme_zns_zone_desc {
 			/** Zone Finished by controller */
 			uint8_t zfc: 1;
 
-			/** Zone Finish Recommended */
-			uint8_t zfr: 1;
+			/** Finish Zone Recommended */
+			uint8_t fzr: 1;
 
 			/** Reset Zone Recommended */
 			uint8_t rzr: 1;
 
 			uint8_t rsvd3 : 4;
 
-			/** Zone Descriptor Valid */
+			/** Zone Descriptor Extension Valid */
 			uint8_t zdev: 1;
 		} bits;
 	} za;

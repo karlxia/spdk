@@ -55,10 +55,17 @@ function ocf_precompile() {
 function build_native_dpdk() {
 	local external_dpdk_dir
 	local external_dpdk_base_dir
-	local gcc_version
+	local compiler_version
+	local compiler
 
-	gcc_version=$(gcc -dumpversion)
-	gcc_version=${gcc_version//./}
+	compiler=${CC:-gcc}
+	if [[ $compiler != *clang* && $compiler != *gcc* ]]; then
+		echo "Unsupported compiler detected ($compiler), failing the test" >&2
+		return 1
+	fi
+
+	compiler_version=$("$compiler" -dumpversion)
+	compiler_version=${compiler_version%%.*}
 	external_dpdk_dir="$SPDK_RUN_EXTERNAL_DPDK"
 	external_dpdk_base_dir="$(dirname $external_dpdk_dir)"
 
@@ -75,11 +82,11 @@ function build_native_dpdk() {
 	dpdk_cflags="-fPIC -g -fcommon"
 	dpdk_ldflags=""
 
-	if [[ $gcc_version -ge 5 ]]; then
+	if [[ $compiler == *gcc* && $compiler_version -ge 5 ]]; then
 		dpdk_cflags+=" -Werror"
 	fi
 
-	if [[ $gcc_version -ge 10 ]]; then
+	if [[ $compiler == *gcc* && $compiler_version -ge 10 ]]; then
 		dpdk_cflags+=" -Wno-stringop-overflow"
 	fi
 
@@ -118,6 +125,14 @@ function build_native_dpdk() {
 		DPDK_DRIVERS+=("compress/isal")
 		DPDK_DRIVERS+=("compress/qat")
 		DPDK_DRIVERS+=("common/qat")
+		if ge "$(< "$external_dpdk_base_dir/VERSION")" 21.02.0; then
+			# SPDK enables REDUCE_MLX in case supported version of DPDK is detected
+			# so make sure proper libs are built.
+			DPDK_DRIVERS+=("bus/auxiliary")
+			DPDK_DRIVERS+=("common/mlx5")
+			DPDK_DRIVERS+=("common/mlx5/linux")
+			DPDK_DRIVERS+=("compress/mlx5")
+		fi
 		export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$isal_dir/build/lib/pkgconfig"
 		export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$isal_dir/build/lib"
 	fi

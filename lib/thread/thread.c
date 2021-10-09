@@ -1263,8 +1263,7 @@ period_poller_interrupt_init(struct spdk_poller *poller)
 		return -errno;
 	}
 
-	rc = spdk_fd_group_add(fgrp, timerfd,
-			       interrupt_timerfd_process, poller);
+	rc = SPDK_FD_GROUP_ADD(fgrp, timerfd, interrupt_timerfd_process, poller);
 	if (rc < 0) {
 		close(timerfd);
 		return rc;
@@ -1352,7 +1351,8 @@ busy_poller_interrupt_init(struct spdk_poller *poller)
 		return -errno;
 	}
 
-	rc = spdk_fd_group_add(poller->thread->fgrp, busy_efd, poller->fn, poller->arg);
+	rc = spdk_fd_group_add(poller->thread->fgrp, busy_efd,
+			       poller->fn, poller->arg, poller->name);
 	if (rc < 0) {
 		close(busy_efd);
 		return rc;
@@ -1550,6 +1550,16 @@ spdk_poller_register_named(spdk_poller_fn fn,
 	return poller_register(fn, arg, period_microseconds, name);
 }
 
+static void
+wrong_thread(const char *func, const char *name, struct spdk_thread *thread,
+	     struct spdk_thread *curthread)
+{
+	SPDK_ERRLOG("%s(%s) called from wrong thread %s:%" PRIu64 " (should be "
+		    "%s:%" PRIu64 ")\n", func, name, curthread->name, curthread->id,
+		    thread->name, thread->id);
+	assert(false);
+}
+
 void
 spdk_poller_unregister(struct spdk_poller **ppoller)
 {
@@ -1570,8 +1580,7 @@ spdk_poller_unregister(struct spdk_poller **ppoller)
 	}
 
 	if (poller->thread != thread) {
-		SPDK_ERRLOG("different from the thread that called spdk_poller_register()\n");
-		assert(false);
+		wrong_thread(__func__, poller->name, poller->thread, thread);
 		return;
 	}
 
@@ -1606,8 +1615,7 @@ spdk_poller_pause(struct spdk_poller *poller)
 	}
 
 	if (poller->thread != thread) {
-		SPDK_ERRLOG("different from the thread that called spdk_poller_pause()\n");
-		assert(false);
+		wrong_thread(__func__, poller->name, poller->thread, thread);
 		return;
 	}
 
@@ -1643,8 +1651,7 @@ spdk_poller_resume(struct spdk_poller *poller)
 	}
 
 	if (poller->thread != thread) {
-		SPDK_ERRLOG("different from the thread that called spdk_poller_resume()\n");
-		assert(false);
+		wrong_thread(__func__, poller->name, poller->thread, thread);
 		return;
 	}
 
@@ -2199,8 +2206,7 @@ spdk_put_io_channel(struct spdk_io_channel *ch)
 	}
 
 	if (ch->thread != thread) {
-		SPDK_ERRLOG("different from the thread that called get_io_channel()\n");
-		assert(false);
+		wrong_thread(__func__, "ch", ch->thread, thread);
 		return;
 	}
 
@@ -2481,7 +2487,8 @@ thread_interrupt_create(struct spdk_thread *thread)
 		return rc;
 	}
 
-	return spdk_fd_group_add(thread->fgrp, thread->msg_fd, thread_interrupt_msg_process, thread);
+	return SPDK_FD_GROUP_ADD(thread->fgrp, thread->msg_fd,
+				 thread_interrupt_msg_process, thread);
 }
 #else
 static int
@@ -2510,7 +2517,7 @@ spdk_interrupt_register(int efd, spdk_interrupt_fn fn,
 		return NULL;
 	}
 
-	ret = spdk_fd_group_add(thread->fgrp, efd, fn, arg);
+	ret = spdk_fd_group_add(thread->fgrp, efd, fn, arg, name);
 
 	if (ret != 0) {
 		SPDK_ERRLOG("thread %s: failed to add fd %d: %s\n",
@@ -2556,8 +2563,7 @@ spdk_interrupt_unregister(struct spdk_interrupt **pintr)
 	}
 
 	if (intr->thread != thread) {
-		SPDK_ERRLOG("different from the thread that called spdk_interrupt_register()\n");
-		assert(false);
+		wrong_thread(__func__, intr->name, intr->thread, thread);
 		return;
 	}
 
@@ -2578,8 +2584,7 @@ spdk_interrupt_set_event_types(struct spdk_interrupt *intr,
 	}
 
 	if (intr->thread != thread) {
-		SPDK_ERRLOG("different from the thread that called spdk_interrupt_register()\n");
-		assert(false);
+		wrong_thread(__func__, intr->name, intr->thread, thread);
 		return -EINVAL;
 	}
 
